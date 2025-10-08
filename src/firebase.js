@@ -8,10 +8,12 @@ import "dotenv/config";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 console.log("[FIREBASE] CWD =", process.cwd());
 console.log("[FIREBASE] RAW GOOGLE_APPLICATION_CREDENTIALS =", process.env.GOOGLE_APPLICATION_CREDENTIALS);
 console.log("[FIREBASE] CWD =", process.cwd());
 console.log("[FIREBASE] RAW GOOGLE_APPLICATION_CREDENTIALS =", process.env.GOOGLE_APPLICATION_CREDENTIALS);
+
 
 function normalizeEnvPath(p) {
   if (!p) return p;
