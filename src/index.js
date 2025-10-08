@@ -4,6 +4,8 @@ import cors from "cors";
 import alumnosRouter from "./routes/alumnos.js";
 import { firestore } from "./firebase.js"; // 👈 importa Firestore
 
+
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
