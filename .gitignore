@@ -1,0 +1,18 @@
+# Dependencias
+node_modules/
+
+# Builds
+dist/
+build/
+
+# Archivos de entorno
+.env
+.env.local
+.env.development
+.env.production
+
+# Claves o credenciales sensibles
+*.json
+*.key
+*.pem
+*.p12
