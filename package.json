@@ -1,0 +1,22 @@
+{
+  "name": "colegio-api",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node src/index.js",
+    "seed:dev": "FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed.js",
+    "seed:prod": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}
