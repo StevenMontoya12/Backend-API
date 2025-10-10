@@ -3,16 +3,16 @@ import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
 import { mapExternalAlumno } from "../utils/mapExternaAlumno.js";
 import admin from "firebase-admin";
-import { FieldPath } from "firebase-admin/firestore"; // para __name__
-import { strip } from "../utils/normalize.js";
+import { FieldPath } from "firebase-admin/firestore"; // 👈 para documentId()
 
 const router = Router();
 const col = firestore.collection("alumnos");
 
-// Sanitiza + defaults + índices normalizados
+// util: sanitizar y defaults
 function toAlumnoPayload(body) {
   const now = new Date().toISOString();
 
+  // Clona y fuerza strings para evitar undefined
   const f = {
     matricula: String(body.matricula || "").trim(),
     estatus: body.estatus || "activo",
@@ -73,11 +73,6 @@ function toAlumnoPayload(body) {
     general: body.general || "",
     cobros: body.cobros || "",
 
-    // 🔎 índices normalizados
-    nombreIndex: strip(`${body.nombres || ""} ${body.apellidos || ""}`),
-    matriculaIndex: strip(body.matricula || ""),
-    correoIndex: strip(body.correoFamiliar || ""),
-
     updatedAt: now,
   };
 
@@ -88,6 +83,7 @@ function toAlumnoPayload(body) {
 router.post("/", async (req, res) => {
   try {
     const { f, now } = toAlumnoPayload(req.body);
+
     if (!f.matricula) {
       return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
     }
@@ -95,6 +91,7 @@ router.post("/", async (req, res) => {
     const ref = col.doc(f.matricula);
     const snap = await ref.get();
     if (snap.exists) {
+      // Si quieres permitir overwrite, elimina este bloque
       return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
     }
 
@@ -106,75 +103,60 @@ router.post("/", async (req, res) => {
 });
 
 /**
- * Listar alumnos con búsqueda por prefijo y paginación por cursor compuesto.
- * Query:
- *  - q: string (>=2) para buscar por nombreIndex (prefijo)
- *  - pageSize: tamaño de página (default 50, máx 100)
- *  - cursores:
- *     * sin q: saApellido, saId
- *     * con q: saNombre, saId2   (nombreIndex + __name__)
+ * Listar alumnos
+ * - Paginación con cursor doble (apellidos + documentId)
+ * - Parámetros:
+ *    - pageSize: tamaño de página (default 50, máx 500)
+ *    - saApellido, saId: cursores de la página anterior
+ *    - all=true: (opcional) trae TODO en lotes sin tocar el front
  */
 router.get("/", async (req, res) => {
   try {
-    const pageSize = Math.min(Number(req.query.pageSize || 50), 100);
-    const q = (req.query.q || "").toString().trim();
-    const hasQ = q.length >= 2;
+    const fetchAll = String(req.query.all || "false").toLowerCase() === "true";
 
-    // cursores
+    const pageSize = Math.min(Number(req.query.pageSize || 50), 500);
     const saApellido = typeof req.query.saApellido === "string" ? req.query.saApellido : null;
     const saId       = typeof req.query.saId === "string" ? req.query.saId : null;
-    const saNombre   = typeof req.query.saNombre === "string" ? req.query.saNombre : null;
-    const saId2      = typeof req.query.saId2 === "string" ? req.query.saId2 : null;
 
-    let query;
-
-    if (hasQ) {
-      const qNorm = strip(q);
-      // Prefijo: nombreIndex ∈ [qNorm, qNorm + \uf8ff]
-      query = col
-        .orderBy("nombreIndex", "asc")
-        .orderBy(FieldPath.documentId(), "asc")
-        .startAt(qNorm)
-        .endAt(qNorm + "\uf8ff")
-        .limit(pageSize);
-
-      if (saNombre && saId2) {
-        query = query.startAfter(saNombre, saId2);
-      }
-    } else {
-      // Lista sin filtro con orden estable
-      query = col
+    const getPage = async (apellidoCursor, idCursor) => {
+      let q = col
         .orderBy("apellidos", "asc")
         .orderBy(FieldPath.documentId(), "asc")
         .limit(pageSize);
 
-      if (saApellido && saId) {
-        query = query.startAfter(saApellido, saId);
+      if (apellidoCursor !== null && idCursor !== null) {
+        q = q.startAfter(apellidoCursor, idCursor);
       }
+
+      const snap = await q.get();
+      const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const last = snap.docs[snap.docs.length - 1] || null;
+      const next = last
+        ? { saApellido: (last.get("apellidos") ?? ""), saId: last.id }
+        : null;
+
+      return { items, next };
+    };
+
+    if (!fetchAll) {
+      const { items, next } = await getPage(saApellido, saId);
+      return res.json({ ok: true, items, next, pageSize });
     }
 
-    // Página + total (si está disponible count())
-    const [snap, agg] = await Promise.all([
-      query.get(),
-      col.count().get().catch(() => null),
-    ]);
+    // Modo all=true: itera hasta traer todo (útil mientras ajustas el front)
+    let allItems = [];
+    let cursorApe = saApellido ?? null;
+    let cursorId  = saId ?? null;
 
-    const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const lastDoc = snap.docs[snap.docs.length - 1] || null;
+    for (let i = 0; i < 200; i++) { // tope de seguridad
+      const { items, next } = await getPage(cursorApe, cursorId);
+      allItems = allItems.concat(items);
+      if (!next) break;
+      cursorApe = next.saApellido;
+      cursorId  = next.saId;
+    }
 
-    const next = lastDoc
-      ? hasQ
-        ? { saNombre: lastDoc.get("nombreIndex") || "", saId2: lastDoc.id }
-        : { saApellido: lastDoc.get("apellidos") || "", saId: lastDoc.id }
-      : null;
-
-    res.json({
-      ok: true,
-      items,
-      next,
-      total: agg ? agg.data().count : undefined,
-      pageSize,
-    });
+    return res.json({ ok: true, items: allItems, next: null, pageSize });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -219,6 +201,10 @@ router.delete("/:matricula", async (req, res) => {
 });
 
 // Import masivo: CSV (text/csv) o JSON (application/json)
+// Query:
+//   ?dryRun=true        -> valida y NO escribe
+//   ?merge=true         -> upsert (conserva campos previos)
+//   ?blockOverwrite=true-> si existe y merge=true, falla
 router.post("/import", async (req, res) => {
   try {
     const dryRun = String(req.query.dryRun || "false").toLowerCase() === "true";
@@ -277,20 +263,7 @@ router.post("/import", async (req, res) => {
 
       for (const { matricula, body } of slice) {
         const ref = col.doc(matricula);
-
-        // 🔎 asegura índices normalizados en import
-        const nombreIndex = strip(`${body.nombres || ""} ${body.apellidos || ""}`);
-        const matriculaIndex = strip(matricula || body.matricula || "");
-        const correoIndex = strip(body.correoFamiliar || "");
-
-        const data = {
-          ...body,
-          nombreIndex,
-          matriculaIndex,
-          correoIndex,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        };
-
+        const data = { ...body, updatedAt: admin.firestore.FieldValue.serverTimestamp() };
         if (!merge) {
           batch.set(ref, { ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: false });
         } else {
