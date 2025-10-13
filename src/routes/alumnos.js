@@ -2,20 +2,31 @@
 import { Router } from "express";
 import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
-import { mapExternalAlumno } from "../utils/mapExternaAlumno.js";
+import { mapExternalAlumno as mapExternaAlumno } from "../utils/mapExternaAlumno.js";
 import admin from "firebase-admin";
 import { FieldPath } from "firebase-admin/firestore";
 import { strip } from "../utils/normalize.js";
 
 const router = Router();
+
+/** 🔴 Evitar cache HTTP en todas las respuestas de este router */
+router.use((req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
+  next();
+});
+
 const col = firestore.collection("alumnos");
 
-// Sanitiza + defaults + índices normalizados
+/** ========================= Helpers ========================= */
 function toAlumnoPayload(body) {
   const now = new Date().toISOString();
 
   const f = {
     matricula: String(body.matricula || "").trim(),
+
     estatus: body.estatus || "activo",
     nombres: body.nombres || "",
     apellidos: body.apellidos || "",
@@ -74,7 +85,11 @@ function toAlumnoPayload(body) {
     general: body.general || "",
     cobros: body.cobros || "",
 
-    // 🔎 índices normalizados
+    nivel: body.nivel || "",
+    grado: body.grado || "",
+    grupo: body.grupo || "",
+
+    // índices normalizados
     nombreIndex: strip(`${body.nombres || ""} ${body.apellidos || ""}`),
     matriculaIndex: strip(body.matricula || ""),
     correoIndex: strip(body.correoFamiliar || ""),
@@ -85,88 +100,87 @@ function toAlumnoPayload(body) {
   return { f, now };
 }
 
-// Crear alumno (ID = matrícula)
+function buildPatchFromBody(body) {
+  const allowed = [
+    "estatus","nombres","apellidos","genero","fechaNacimiento","curp","nacionalidad","clave",
+    "grupoPrincipal","fechaIngreso","modalidad","religion","calleNumero","estado","municipio","colonia",
+    "codigoPostal","telefonoCasa","telefonoCelular","contactoPrincipal","numeroHermanos","nombrePadre",
+    "apellidosPadre","telefonoPadre","correoPadre","ocupacionPadre","empresaPadre","telefonoEmpresa",
+    "tokenPago","exalumno","correoFamiliar","tipoBeca","porcentajeBeca","actividad","nombreFactura",
+    "calleNumeroFactura","coloniaFactura","estadoFactura","municipioFactura","codigoPostalFactura",
+    "telefonoCasaFactura","emailFactura","rfc","numeroCuenta","tipoCobro","usoCfdi","requiereFactura",
+    "calificaciones","general","cobros","nivel","grado","grupo"
+  ];
+  const patch = {};
+  for (const k of allowed) {
+    if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "matricula")) delete patch.matricula;
+  return patch;
+}
+
+/** ========================= Endpoints ========================= */
+
+// Crear
 router.post("/", async (req, res) => {
   try {
     const { f, now } = toAlumnoPayload(req.body);
-    if (!f.matricula) {
-      return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
-    }
+    if (!f.matricula) return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
 
     const ref = col.doc(f.matricula);
     const snap = await ref.get();
-    if (snap.exists) {
-      return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
-    }
+    if (snap.exists) return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
 
-    await ref.set({ ...f, createdAt: now });
-    res.json({ ok: true, id: ref.id });
+    const data = { ...f, createdAt: now };
+    await ref.set(data);
+    res.json({ ok: true, data: { id: ref.id, ...data } });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-/**
- * Listar alumnos con búsqueda por prefijo y paginación por cursor compuesto.
- * Query:
- *  - q: string (>=2) para buscar por nombreIndex (prefijo)
- *  - pageSize: tamaño de página (default 50, máx 100)
- *  - cursores:
- *     * sin q: saApellido, saId
- *     * con q: saNombre, saId2   (nombreIndex + __name__)
- */
+// Listado con búsqueda/paginación (prefijo sobre nombreIndex)
 router.get("/", async (req, res) => {
   try {
     const pageSize = Math.min(Number(req.query.pageSize || 50), 100);
     const q = (req.query.q || "").toString().trim();
     const hasQ = q.length >= 2;
 
-    // cursores
     const saApellido = typeof req.query.saApellido === "string" ? req.query.saApellido : null;
     const saId       = typeof req.query.saId === "string" ? req.query.saId : null;
     const saNombre   = typeof req.query.saNombre === "string" ? req.query.saNombre : null;
     const saId2      = typeof req.query.saId2 === "string" ? req.query.saId2 : null;
 
     let query;
-
     if (hasQ) {
       const qNorm = strip(q);
-      // Prefijo: nombreIndex ∈ [qNorm, qNorm + \uf8ff]
       query = col
         .orderBy("nombreIndex", "asc")
         .orderBy(FieldPath.documentId(), "asc")
         .startAt(qNorm)
         .endAt(qNorm + "\uf8ff")
         .limit(pageSize);
-
-      if (saNombre && saId2) {
-        query = query.startAfter(saNombre, saId2);
-      }
+      if (saNombre && saId2) query = query.startAfter(saNombre, saId2);
     } else {
-      // Lista sin filtro con orden estable
       query = col
         .orderBy("apellidos", "asc")
         .orderBy(FieldPath.documentId(), "asc")
         .limit(pageSize);
-
-      if (saApellido && saId) {
-        query = query.startAfter(saApellido, saId);
-      }
+      if (saApellido && saId) query = query.startAfter(saApellido, saId);
     }
 
-    // Página + total (si está disponible count())
     const [snap, agg] = await Promise.all([
       query.get(),
       col.count().get().catch(() => null),
     ]);
 
     const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const lastDoc = snap.docs[snap.docs.length - 1] || null;
+    const last = snap.docs[snap.docs.length - 1] || null;
 
-    const next = lastDoc
+    const next = last
       ? hasQ
-        ? { saNombre: lastDoc.get("nombreIndex") || "", saId2: lastDoc.id }
-        : { saApellido: lastDoc.get("apellidos") || "", saId: lastDoc.id }
+        ? { saNombre: last.get("nombreIndex") || "", saId2: last.id }
+        : { saApellido: last.get("apellidos") || "", saId: last.id }
       : null;
 
     res.json({
@@ -181,7 +195,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-// Obtener alumno por matrícula
+// Obtener por matrícula
 router.get("/:matricula", async (req, res) => {
   try {
     const ref = col.doc(req.params.matricula);
@@ -193,17 +207,25 @@ router.get("/:matricula", async (req, res) => {
   }
 });
 
-// Actualizar (merge) por matrícula
+// Actualizar (merge real) + recalcular índices
 router.patch("/:matricula", async (req, res) => {
   try {
-    const { f, now } = toAlumnoPayload(req.body);
-    const ref = col.doc(req.params.matricula);
+    const id = req.params.matricula;
+    const ref = col.doc(id);
+    const prev = await ref.get();
+    if (!prev.exists) return res.status(404).json({ ok: false, error: "No encontrado" });
 
-    // Evita que cambien la matrícula del doc
-    delete f.matricula;
+    const patch = buildPatchFromBody(req.body);
+    const prevData = prev.data() || {};
+    const finalData = { ...prevData, ...patch };
 
-    await ref.set({ ...f, updatedAt: now }, { merge: true });
-    res.json({ ok: true });
+    finalData.nombreIndex    = strip(`${finalData.nombres || ""} ${finalData.apellidos || ""}`);
+    finalData.matriculaIndex = strip(id);
+    finalData.correoIndex    = strip(finalData.correoFamiliar || "");
+    finalData.updatedAt      = new Date().toISOString();
+
+    await ref.set(finalData, { merge: false });
+    res.json({ ok: true, data: { id, ...finalData } });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -212,14 +234,15 @@ router.patch("/:matricula", async (req, res) => {
 // Eliminar
 router.delete("/:matricula", async (req, res) => {
   try {
-    await col.doc(req.params.matricula).delete();
-    res.json({ ok: true });
+    const id = req.params.matricula;
+    await col.doc(id).delete();
+    res.json({ ok: true, id });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Import masivo: CSV (text/csv) o JSON (application/json)
+// Import masivo (CSV / JSON)
 router.post("/import", async (req, res) => {
   try {
     const dryRun = String(req.query.dryRun || "false").toLowerCase() === "true";
@@ -245,24 +268,18 @@ router.post("/import", async (req, res) => {
     const errors = [];
     for (let i = 0; i < rows.length; i++) {
       try {
-        const { matricula, body } = mapExternalAlumno(rows[i]);
+        const { matricula, body } = mapExternaAlumno(rows[i]);
         converted.push({ matricula, body });
       } catch (e) {
         errors.push({ index: i, error: String(e), row: rows[i] });
       }
     }
 
-    if (errors.length) {
-      return res.status(400).json({ ok: false, errors, validCount: converted.length });
-    }
-
-    if (dryRun) {
-      return res.json({ ok: true, dryRun: true, count: converted.length });
-    }
+    if (errors.length) return res.status(400).json({ ok: false, errors, validCount: converted.length });
+    if (dryRun) return res.json({ ok: true, dryRun: true, count: converted.length });
 
     const BATCH_SIZE = 400;
     let written = 0;
-
     for (let i = 0; i < converted.length; i += BATCH_SIZE) {
       const batch = firestore.batch();
       const slice = converted.slice(i, i + BATCH_SIZE);
@@ -278,12 +295,9 @@ router.post("/import", async (req, res) => {
 
       for (const { matricula, body } of slice) {
         const ref = col.doc(matricula);
-
-        // 🔎 asegura índices normalizados en import
         const nombreIndex = strip(`${body.nombres || ""} ${body.apellidos || ""}`);
         const matriculaIndex = strip(matricula || body.matricula || "");
         const correoIndex = strip(body.correoFamiliar || "");
-
         const data = {
           ...body,
           nombreIndex,
@@ -291,7 +305,6 @@ router.post("/import", async (req, res) => {
           correoIndex,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
-
         if (!merge) {
           batch.set(ref, { ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: false });
         } else {
