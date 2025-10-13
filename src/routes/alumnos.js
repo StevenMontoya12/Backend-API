@@ -1,9 +1,10 @@
+// routes/alumnos.js
 import { Router } from "express";
 import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
 import { mapExternalAlumno } from "../utils/mapExternaAlumno.js";
 import admin from "firebase-admin";
-import { FieldPath } from "firebase-admin/firestore"; // para __name__
+import { FieldPath } from "firebase-admin/firestore";
 import { strip } from "../utils/normalize.js";
 
 const router = Router();
