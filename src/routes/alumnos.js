@@ -8,21 +8,54 @@ import { FieldPath } from "firebase-admin/firestore";
 import { strip } from "../utils/normalize.js";
 
 const router = Router();
-
-/** 🔴 Evitar cache HTTP en todas las respuestas de este router */
-router.use((req, res, next) => {
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-  res.set("Surrogate-Control", "no-store");
-  next();
-});
-
 const col = firestore.collection("alumnos");
+const tombstones = firestore.collection("alumnos_deleted");
+const metasDoc = firestore.doc("metas/alumnos");
 
-/** ========================= Helpers ========================= */
+// ────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────
+
+/** Asegura/actualiza doc meta (version/total) */
+async function bumpMeta({ deltaTotal = 0, forceTouch = true } = {}) {
+  const nowISO = new Date().toISOString();
+  const data = {
+    lastUpdatedAt: nowISO,
+    updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (forceTouch) data.version = admin.firestore.FieldValue.increment(1);
+  if (deltaTotal !== 0) data.total = admin.firestore.FieldValue.increment(deltaTotal);
+  await metasDoc.set(data, { merge: true });
+}
+
+/** Lee meta defensivamente */
+async function readMeta() {
+  const snap = await metasDoc.get();
+  if (!snap.exists) {
+    // Inicializa meta con total actual
+    const agg = await col.count().get().catch(() => null);
+    const total = agg ? agg.data().count : 0;
+    const nowISO = new Date().toISOString();
+    const init = {
+      version: 1,
+      total,
+      lastUpdatedAt: nowISO,
+      updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await metasDoc.set(init, { merge: false });
+    return { version: 1, total, lastUpdatedAt: nowISO };
+  }
+  const d = snap.data() || {};
+  return {
+    version: d.version ?? 1,
+    total: d.total ?? undefined,
+    lastUpdatedAt: d.lastUpdatedAt ?? null,
+  };
+}
+
+/** Construye payload saneado */
 function toAlumnoPayload(body) {
-  const now = new Date().toISOString();
+  const nowISO = new Date().toISOString();
 
   const f = {
     matricula: String(body.matricula || "").trim(),
@@ -94,12 +127,15 @@ function toAlumnoPayload(body) {
     matriculaIndex: strip(body.matricula || ""),
     correoIndex: strip(body.correoFamiliar || ""),
 
-    updatedAt: now,
+    // sellos
+    updatedAt: nowISO,
+    updatedAtTs: admin.firestore.FieldValue.serverTimestamp(), // <— para queries por tiempo
   };
 
-  return { f, now };
+  return { f, nowISO };
 }
 
+/** Construye patch parcial desde body (solo campos presentes) */
 function buildPatchFromBody(body) {
   const allowed = [
     "estatus","nombres","apellidos","genero","fechaNacimiento","curp","nacionalidad","clave",
@@ -113,43 +149,117 @@ function buildPatchFromBody(body) {
   ];
   const patch = {};
   for (const k of allowed) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
+    if (Object.prototype.hasOwnProperty.call(body, k)) {
+      patch[k] = body[k];
+    }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "matricula")) delete patch.matricula;
   return patch;
 }
 
-/** ========================= Endpoints ========================= */
+// ────────────────────────────────────────────────────────────────
+/** Endpoints */
+// ────────────────────────────────────────────────────────────────
 
-// Crear
+// META — versión, total, última actualización
+router.get("/meta", async (_req, res) => {
+  try {
+    const meta = await readMeta();
+    res.json({ ok: true, ...meta });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// CHANGES — deltas desde un instante
+router.get("/changes", async (req, res) => {
+  try {
+    const since = String(req.query.since || "").trim();
+    if (!since) return res.status(400).json({ ok: false, error: "since requerido (ISO date)" });
+    const sinceDate = new Date(since);
+    if (Number.isNaN(sinceDate.getTime())) {
+      return res.status(400).json({ ok: false, error: "since inválido" });
+    }
+
+    const nowISO = new Date().toISOString();
+
+    // updated
+    const qUpdated = await col
+      .where("updatedAtTs", ">", sinceDate)
+      .orderBy("updatedAtTs", "asc")
+      .limit(1000) // defensivo
+      .get();
+
+    const updated = qUpdated.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    // deleted — leemos tombstones
+    const qDeleted = await tombstones
+      .where("deletedAtTs", ">", sinceDate)
+      .orderBy("deletedAtTs", "asc")
+      .limit(1000)
+      .get();
+
+    const deleted = qDeleted.docs.map((d) => d.id);
+
+    res.json({ ok: true, since, now: nowISO, updated, deleted });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Crear alumno
 router.post("/", async (req, res) => {
   try {
-    const { f, now } = toAlumnoPayload(req.body);
-    if (!f.matricula) return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
+    const { f, nowISO } = toAlumnoPayload(req.body);
+    if (!f.matricula) {
+      return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
+    }
 
     const ref = col.doc(f.matricula);
     const snap = await ref.get();
-    if (snap.exists) return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
+    if (snap.exists) {
+      return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
+    }
 
-    const data = { ...f, createdAt: now };
+    const data = { ...f, createdAt: nowISO, createdAtTs: admin.firestore.FieldValue.serverTimestamp() };
     await ref.set(data);
+
+    // limpia tombstone si existía
+    await tombstones.doc(ref.id).delete().catch(() => {});
+
+    // meta: +1 total, versión++
+    await bumpMeta({ deltaTotal: +1, forceTouch: true });
+
     res.json({ ok: true, data: { id: ref.id, ...data } });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Listado con búsqueda/paginación (prefijo sobre nombreIndex)
+/**
+ * Listar alumnos con búsqueda+cursor.
+ * Devuelve ETag basado en meta.version y los parámetros.
+ */
 router.get("/", async (req, res) => {
   try {
     const pageSize = Math.min(Number(req.query.pageSize || 50), 100);
     const q = (req.query.q || "").toString().trim();
     const hasQ = q.length >= 2;
 
+    // cursores
     const saApellido = typeof req.query.saApellido === "string" ? req.query.saApellido : null;
     const saId       = typeof req.query.saId === "string" ? req.query.saId : null;
     const saNombre   = typeof req.query.saNombre === "string" ? req.query.saNombre : null;
     const saId2      = typeof req.query.saId2 === "string" ? req.query.saId2 : null;
+
+    // ETag (si versión no cambió y params tampoco, 304)
+    const meta = await readMeta();
+    const etag = `"alumnos:${meta.version}|q=${hasQ ? q : ""}|ps=${pageSize}|a=${saApellido || ""}|i=${saId || ""}|n=${saNombre || ""}|i2=${saId2 || ""}"`;
+    const inm = req.headers["if-none-match"];
+    if (inm && inm === etag) {
+      res.status(304).end();
+      return;
+    }
 
     let query;
     if (hasQ) {
@@ -160,34 +270,35 @@ router.get("/", async (req, res) => {
         .startAt(qNorm)
         .endAt(qNorm + "\uf8ff")
         .limit(pageSize);
+
       if (saNombre && saId2) query = query.startAfter(saNombre, saId2);
     } else {
       query = col
         .orderBy("apellidos", "asc")
         .orderBy(FieldPath.documentId(), "asc")
         .limit(pageSize);
+
       if (saApellido && saId) query = query.startAfter(saApellido, saId);
     }
 
-    const [snap, agg] = await Promise.all([
-      query.get(),
-      col.count().get().catch(() => null),
-    ]);
+    const snap = await query.get();
 
     const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const last = snap.docs[snap.docs.length - 1] || null;
+    const lastDoc = snap.docs[snap.docs.length - 1] || null;
 
-    const next = last
+    const next = lastDoc
       ? hasQ
-        ? { saNombre: last.get("nombreIndex") || "", saId2: last.id }
-        : { saApellido: last.get("apellidos") || "", saId: last.id }
+        ? { saNombre: lastDoc.get("nombreIndex") || "", saId2: lastDoc.id }
+        : { saApellido: lastDoc.get("apellidos") || "", saId: lastDoc.id }
       : null;
 
+    res.setHeader("ETag", etag);
     res.json({
       ok: true,
       items,
       next,
-      total: agg ? agg.data().count : undefined,
+      // usa meta.total (evitas count() por request)
+      total: meta.total,
       pageSize,
     });
   } catch (e) {
@@ -195,7 +306,7 @@ router.get("/", async (req, res) => {
   }
 });
 
-// Obtener por matrícula
+// Obtener alumno por matrícula
 router.get("/:matricula", async (req, res) => {
   try {
     const ref = col.doc(req.params.matricula);
@@ -207,7 +318,7 @@ router.get("/:matricula", async (req, res) => {
   }
 });
 
-// Actualizar (merge real) + recalcular índices
+// Patch (merge manual) + recalcular índices + sellos
 router.patch("/:matricula", async (req, res) => {
   try {
     const id = req.params.matricula;
@@ -223,26 +334,45 @@ router.patch("/:matricula", async (req, res) => {
     finalData.matriculaIndex = strip(id);
     finalData.correoIndex    = strip(finalData.correoFamiliar || "");
     finalData.updatedAt      = new Date().toISOString();
+    finalData.updatedAtTs    = admin.firestore.FieldValue.serverTimestamp();
 
     await ref.set(finalData, { merge: false });
+
+    // meta: versión++
+    await bumpMeta({ deltaTotal: 0, forceTouch: true });
+
     res.json({ ok: true, data: { id, ...finalData } });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Eliminar
+// Eliminar — crea tombstone y decrementa total
 router.delete("/:matricula", async (req, res) => {
   try {
     const id = req.params.matricula;
+
+    // borra doc
     await col.doc(id).delete();
+
+    // escribe tombstone
+    const nowISO = new Date().toISOString();
+    await tombstones.doc(id).set({
+      id,
+      deletedAt: nowISO,
+      deletedAtTs: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // meta: -1 total, versión++
+    await bumpMeta({ deltaTotal: -1, forceTouch: true });
+
     res.json({ ok: true, id });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Import masivo (CSV / JSON)
+// Import masivo
 router.post("/import", async (req, res) => {
   try {
     const dryRun = String(req.query.dryRun || "false").toLowerCase() === "true";
@@ -275,11 +405,18 @@ router.post("/import", async (req, res) => {
       }
     }
 
-    if (errors.length) return res.status(400).json({ ok: false, errors, validCount: converted.length });
-    if (dryRun) return res.json({ ok: true, dryRun: true, count: converted.length });
+    if (errors.length) {
+      return res.status(400).json({ ok: false, errors, validCount: converted.length });
+    }
+
+    if (dryRun) {
+      return res.json({ ok: true, dryRun: true, count: converted.length });
+    }
 
     const BATCH_SIZE = 400;
     let written = 0;
+    let deltaTotal = 0;
+
     for (let i = 0; i < converted.length; i += BATCH_SIZE) {
       const batch = firestore.batch();
       const slice = converted.slice(i, i + BATCH_SIZE);
@@ -295,26 +432,42 @@ router.post("/import", async (req, res) => {
 
       for (const { matricula, body } of slice) {
         const ref = col.doc(matricula);
+
         const nombreIndex = strip(`${body.nombres || ""} ${body.apellidos || ""}`);
         const matriculaIndex = strip(matricula || body.matricula || "");
         const correoIndex = strip(body.correoFamiliar || "");
+        const nowISO = new Date().toISOString();
+
         const data = {
           ...body,
           nombreIndex,
           matriculaIndex,
           correoIndex,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: nowISO,
+          updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: nowISO,
+          createdAtTs: admin.firestore.FieldValue.serverTimestamp(),
         };
+
         if (!merge) {
-          batch.set(ref, { ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: false });
+          batch.set(ref, data, { merge: false });
+          deltaTotal += 1;
         } else {
-          batch.set(ref, { ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          batch.set(ref, data, { merge: true });
+          // si no existía antes, contará como +1 — para simplicidad,
+          // puedes recalcular total al final si prefieres exactitud.
         }
+
+        // limpia tombstone si existía
+        batch.delete(tombstones.doc(matricula));
       }
 
       await batch.commit();
       written += slice.length;
     }
+
+    // meta: versión++, y ajusta total (aprox) — o recalcula total usando count()
+    await bumpMeta({ deltaTotal, forceTouch: true });
 
     res.json({ ok: true, written });
   } catch (e) {
