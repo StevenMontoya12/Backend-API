@@ -1,4 +1,4 @@
-//alumnos.js de utils
+// alumnos.js de utils
 import { Router } from "express";
 import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
@@ -8,6 +8,28 @@ import { FieldPath } from "firebase-admin/firestore"; // 👈 para documentId()
 
 const router = Router();
 const col = firestore.collection("alumnos");
+
+// ── Historial de actividad: sanitizador ─────────────────────────
+function sanitizeHistorialActividad(input) {
+  if (!Array.isArray(input)) return [];
+  const T = new Set(["alta", "baja", "cambio"]);
+  const clean = (v) => (v == null ? "" : String(v).trim());
+  return input
+    .map((r) => {
+      const fecha = new Date(r?.fechaIso ?? r?.fecha ?? "");
+      const tipo = clean(r?.tipo || "").toLowerCase();
+      if (!T.has(tipo)) return null;
+      if (Number.isNaN(fecha.getTime())) return null;
+      return {
+        fechaIso: fecha.toISOString(),
+        tipo,
+        motivo: clean(r?.motivo),
+        usuario: clean(r?.usuario),
+        notas: clean(r?.notas),
+      };
+    })
+    .filter(Boolean);
+}
 
 // util: sanitizar y defaults
 function toAlumnoPayload(body) {
@@ -74,6 +96,9 @@ function toAlumnoPayload(body) {
     general: body.general || "",
     cobros: body.cobros || "",
 
+    // historial de actividad
+    historialActividad: sanitizeHistorialActividad(body.historialActividad),
+
     updatedAt: now,
   };
 
@@ -96,7 +121,13 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
     }
 
-    await ref.set({ ...f, createdAt: now });
+    // Alta automática si vino vacío
+    const historial =
+      Array.isArray(f.historialActividad) && f.historialActividad.length
+        ? f.historialActividad
+        : [{ fechaIso: now, tipo: "alta", motivo: "Alta inicial", usuario: "sistema", notas: "" }];
+
+    await ref.set({ ...f, historialActividad: historial, createdAt: now });
     res.json({ ok: true, id: ref.id });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });

@@ -53,6 +53,29 @@ async function readMeta() {
   };
 }
 
+// ── Historial de actividad: sanitizador ─────────────────────────
+function sanitizeHistorialActividad(input) {
+  if (!Array.isArray(input)) return [];
+  const T = new Set(["alta", "baja", "cambio"]);
+  const clean = (v) => (v == null ? "" : String(v).trim());
+
+  return input
+    .map((r) => {
+      const fecha = new Date(r?.fechaIso ?? r?.fecha ?? "");
+      const tipo = clean(r?.tipo || "").toLowerCase();
+      if (!T.has(tipo)) return null;                 // tipo inválido
+      if (Number.isNaN(fecha.getTime())) return null;// fecha inválida
+      return {
+        fechaIso: fecha.toISOString(),
+        tipo,                                        // "alta" | "baja" | "cambio"
+        motivo: clean(r?.motivo),
+        usuario: clean(r?.usuario),
+        notas: clean(r?.notas),
+      };
+    })
+    .filter(Boolean);
+}
+
 /** Construye payload saneado */
 function toAlumnoPayload(body) {
   const nowISO = new Date().toISOString();
@@ -122,6 +145,9 @@ function toAlumnoPayload(body) {
     grado: body.grado || "",
     grupo: body.grupo || "",
 
+    // historial de actividad
+    historialActividad: sanitizeHistorialActividad(body.historialActividad),
+
     // índices normalizados
     nombreIndex: strip(`${body.nombres || ""} ${body.apellidos || ""}`),
     matriculaIndex: strip(body.matricula || ""),
@@ -145,7 +171,7 @@ function buildPatchFromBody(body) {
     "tokenPago","exalumno","correoFamiliar","tipoBeca","porcentajeBeca","actividad","nombreFactura",
     "calleNumeroFactura","coloniaFactura","estadoFactura","municipioFactura","codigoPostalFactura",
     "telefonoCasaFactura","emailFactura","rfc","numeroCuenta","tipoCobro","usoCfdi","requiereFactura",
-    "calificaciones","general","cobros","nivel","grado","grupo"
+    "calificaciones","general","cobros","nivel","grado","grupo","historialActividad"
   ];
   const patch = {};
   for (const k of allowed) {
@@ -154,6 +180,12 @@ function buildPatchFromBody(body) {
     }
   }
   if (Object.prototype.hasOwnProperty.call(patch, "matricula")) delete patch.matricula;
+
+  // sanitiza historial si viene en el patch
+  if (Object.prototype.hasOwnProperty.call(patch, "historialActividad")) {
+    patch.historialActividad = sanitizeHistorialActividad(patch.historialActividad);
+  }
+
   return patch;
 }
 
@@ -222,6 +254,18 @@ router.post("/", async (req, res) => {
     }
 
     const data = { ...f, createdAt: nowISO, createdAtTs: admin.firestore.FieldValue.serverTimestamp() };
+
+    // Alta automática si vino vacío
+    if (!Array.isArray(data.historialActividad) || data.historialActividad.length === 0) {
+      data.historialActividad = [{
+        fechaIso: nowISO,
+        tipo: "alta",
+        motivo: "Alta inicial",
+        usuario: "sistema",
+        notas: ""
+      }];
+    }
+
     await ref.set(data);
 
     // limpia tombstone si existía
@@ -447,6 +491,7 @@ router.post("/import", async (req, res) => {
           updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
           createdAt: nowISO,
           createdAtTs: admin.firestore.FieldValue.serverTimestamp(),
+          // si body tiene historialActividad, idealmente ya venga limpio desde toAlumnoPayload/map
         };
 
         if (!merge) {
