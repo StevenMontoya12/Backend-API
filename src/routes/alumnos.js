@@ -2,10 +2,11 @@
 import { Router } from "express";
 import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
-import { mapExternalAlumno as mapExternaAlumno } from "../utils/mapExternaAlumno.js";
 import admin from "firebase-admin";
 import { FieldPath } from "firebase-admin/firestore";
 import { strip } from "../utils/normalize.js";
+// (opcional) mapper de import masivo
+import { mapExternalAlumno as mapExternaAlumno } from "../utils/mapExternaAlumno.js";
 
 const router = Router();
 const col = firestore.collection("alumnos");
@@ -13,10 +14,8 @@ const tombstones = firestore.collection("alumnos_deleted");
 const metasDoc = firestore.doc("metas/alumnos");
 
 // ────────────────────────────────────────────────────────────────
-// Helpers
+// Helpers de meta
 // ────────────────────────────────────────────────────────────────
-
-/** Asegura/actualiza doc meta (version/total) */
 async function bumpMeta({ deltaTotal = 0, forceTouch = true } = {}) {
   const nowISO = new Date().toISOString();
   const data = {
@@ -28,7 +27,6 @@ async function bumpMeta({ deltaTotal = 0, forceTouch = true } = {}) {
   await metasDoc.set(data, { merge: true });
 }
 
-/** Lee meta defensivamente */
 async function readMeta() {
   const snap = await metasDoc.get();
   if (!snap.exists) {
@@ -52,7 +50,11 @@ async function readMeta() {
   };
 }
 
-// ── Sanitizadores ───────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────
+// Sanitizadores
+// ────────────────────────────────────────────────────────────────
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
 function sanitizeHistorialActividad(input) {
   if (!Array.isArray(input)) return [];
   const T = new Set(["alta", "baja", "cambio"]);
@@ -62,11 +64,11 @@ function sanitizeHistorialActividad(input) {
     .map((r) => {
       const fecha = new Date(r?.fechaIso ?? r?.fecha ?? "");
       const tipo = clean(r?.tipo || "").toLowerCase();
-      if (!T.has(tipo)) return null;                 // tipo inválido
-      if (Number.isNaN(fecha.getTime())) return null;// fecha inválida
+      if (!T.has(tipo)) return null;
+      if (Number.isNaN(fecha.getTime())) return null;
       return {
         fechaIso: fecha.toISOString(),
-        tipo,                                        // "alta" | "baja" | "cambio"
+        tipo,
         motivo: clean(r?.motivo),
         usuario: clean(r?.usuario),
         notas: clean(r?.notas),
@@ -75,26 +77,119 @@ function sanitizeHistorialActividad(input) {
     .filter(Boolean);
 }
 
-/** Sanitiza array de hermanos (objetos planos con campos permitidos) */
-function sanitizeHermanos(input) {
-  if (!Array.isArray(input)) return [];
-  return input
-    .map((h) => {
-      const id          = h?.id ? String(h.id).trim() : "";
-      const matricula   = h?.matricula ? String(h.matricula).trim() : "";
-      const nombres     = h?.nombres ? String(h.nombres).trim() : "";
-      const apellidos   = h?.apellidos ? String(h.apellidos).trim() : "";
-      const grupoPrin   = h?.grupoPrincipal ? String(h.grupoPrincipal).trim() : "";
-      const nivel       = h?.nivel ? String(h.nivel).trim() : "";
-      if (!id && !matricula) return null; // al menos uno para identificar
-      return { id, matricula, nombres, apellidos, grupoPrincipal: grupoPrin, nivel };
-    })
-    .filter(Boolean);
+// cada hermano guardado en el doc del alumno
+function sanitizeHermano(h) {
+  if (!h) return null;
+  const id = String(h.id || h.matricula || "").trim();
+  if (!id) return null;
+  const out = {
+    id,
+    matricula: String(h.matricula || id).trim(),
+    nombres: String(h.nombres || "").trim(),
+    apellidos: String(h.apellidos || "").trim(),
+    grupoPrincipal: String(h.grupoPrincipal || "").trim(),
+  };
+  if (h.nivel) out.nivel = String(h.nivel);
+  if (h.grado) out.grado = String(h.grado);
+  return out;
 }
 
-/** Construye payload saneado */
+/**
+ * Normaliza TODOS los campos de la sección de Becas que llegan desde el front.
+ * Se devuelven EN PLANO (no anidados) para mantener compatibilidad con el front actual.
+ */
+function sanitizeBecaFlat(body) {
+  const txt = (k, d = "") => (body[k] == null ? d : String(body[k]).trim());
+  const bool = (k) => Boolean(body[k]);
+  const digits = (k, { min = 0, max = Infinity, allowEmpty = true } = {}) => {
+    const raw = String(body[k] ?? "");
+    const only = raw.replace(/[^\d]/g, "");
+    if (allowEmpty && only === "") return "";
+    let n = Number(only);
+    if (Number.isNaN(n)) n = 0;
+    if (Number.isFinite(min)) n = Math.max(min, n);
+    if (Number.isFinite(max)) n = Math.min(max, n);
+    return n;
+  };
+  const date = (k) => {
+    const v = String(body[k] ?? "").trim();
+    if (!v) return "";
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? "" : v.slice(0, 10); // yyyy-mm-dd
+  };
+  const arr = (k, allow = []) => {
+    const v = Array.isArray(body[k]) ? body[k] : [];
+    const S = new Set(allow);
+    return v.map(String).filter((x) => S.has(x));
+  };
+
+  // valores permitidos
+  const aplicaAllow = [
+    "colegiatura",
+    "inscripcion",
+    "reinscripcion",
+    "transporte",
+    "comedor",
+    "materiales",
+    "actividades",
+  ];
+
+  const out = {
+    tipoBeca: txt("tipoBeca"),
+    tipoBecaOtro: txt("tipoBecaOtro"),
+    fuenteBeca: txt("fuenteBeca"),
+    convenioEmpresa: txt("convenioEmpresa"),
+    patrocinador: txt("patrocinador"),
+    folioBeca: txt("folioBeca"),
+
+    porcentajeBeca: digits("porcentajeBeca", { min: 0, max: 100, allowEmpty: false }), // 0–100
+    topeMensual: digits("topeMensual", { min: 0, allowEmpty: true }),
+
+    vigenciaInicio: date("vigenciaInicio"),
+    vigenciaFin: date("vigenciaFin"),
+
+    aplicaA: arr("aplicaA", aplicaAllow),
+
+    estatusBeca: txt("estatusBeca", "activa"),
+    renovable: bool("renovable"),
+
+    requiereServicio: bool("requiereServicio"),
+    horasServicio: digits("horasServicio", { min: 0, allowEmpty: true }),
+
+    promedioMinimo: digits("promedioMinimo", { min: 0, max: 100, allowEmpty: true }),
+    observacionesBeca: txt("observacionesBeca"),
+  };
+
+  // Si tipoBeca no es "Otra", limpiar especificar
+  if (out.tipoBeca !== "Otra") out.tipoBecaOtro = "";
+  // Condicionales por fuente
+  if (out.fuenteBeca !== "Convenio empresarial") out.convenioEmpresa = "";
+  if (out.fuenteBeca !== "Fundación / Patrocinio") out.patrocinador = "";
+
+  // Si vigencias vienen invertidas, corrige
+  if (out.vigenciaInicio && out.vigenciaFin) {
+    const a = new Date(out.vigenciaInicio);
+    const b = new Date(out.vigenciaFin);
+    if (a > b) {
+      const tmp = out.vigenciaInicio;
+      out.vigenciaInicio = out.vigenciaFin;
+      out.vigenciaFin = tmp;
+    }
+  }
+
+  return out;
+}
+
+// payload de alta/edición completo
 function toAlumnoPayload(body) {
   const nowISO = new Date().toISOString();
+
+  const hermanos = Array.isArray(body.hermanos)
+    ? body.hermanos.map(sanitizeHermano).filter(Boolean)
+    : [];
+
+  // —— Becas (campos en plano) ——
+  const beca = sanitizeBecaFlat(body);
 
   const f = {
     matricula: String(body.matricula || "").trim(),
@@ -121,8 +216,9 @@ function toAlumnoPayload(body) {
     telefonoCelular: body.telefonoCelular || "",
     contactoPrincipal: body.contactoPrincipal || "",
 
-    // número seguro
     numeroHermanos: Number.isFinite(Number(body.numeroHermanos)) ? Number(body.numeroHermanos) : 0,
+    hermanoEstudiaAqui: Boolean(body.hermanoEstudiaAqui),
+    hermanos, // ← guardado real
 
     nombrePadre: body.nombrePadre || "",
     apellidosPadre: body.apellidosPadre || "",
@@ -135,8 +231,8 @@ function toAlumnoPayload(body) {
     exalumno: body.exalumno || "no",
     correoFamiliar: body.correoFamiliar || "",
 
-    tipoBeca: body.tipoBeca || "",
-    porcentajeBeca: body.porcentajeBeca || "",
+    // ====== BECAS (todos planos) ======
+    ...beca,
 
     actividad: body.actividad || "",
 
@@ -158,78 +254,83 @@ function toAlumnoPayload(body) {
     general: body.general || "",
     cobros: body.cobros || "",
 
+    // (opcionales si los manejas)
     nivel: body.nivel || "",
     grado: body.grado || "",
     grupo: body.grupo || "",
 
-    // historial de actividad
+    // historial + índices + sellos
     historialActividad: sanitizeHistorialActividad(body.historialActividad),
-
-    // 🔹 NUEVO: hermanos + flag
-    hermanos: sanitizeHermanos(body.hermanos),
-    hermanoEstudiaAqui: Boolean(body.hermanoEstudiaAqui),
-
-    // índices normalizados
     nombreIndex: strip(`${body.nombres || ""} ${body.apellidos || ""}`),
     matriculaIndex: strip(body.matricula || ""),
     correoIndex: strip(body.correoFamiliar || ""),
-
-    // sellos
     updatedAt: nowISO,
-    updatedAtTs: admin.firestore.FieldValue.serverTimestamp(), // <— para queries por tiempo
+    updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
   };
 
   return { f, nowISO };
 }
 
-/** Construye patch parcial desde body (solo campos presentes) */
+/** Construye patch parcial (solo campos presentes) + sanitiza. */
 function buildPatchFromBody(body) {
+  // lista blanca base
   const allowed = [
     "estatus","nombres","apellidos","genero","fechaNacimiento","curp","nacionalidad","clave",
     "grupoPrincipal","fechaIngreso","modalidad","religion","calleNumero","estado","municipio","colonia",
     "codigoPostal","telefonoCasa","telefonoCelular","contactoPrincipal","numeroHermanos","nombrePadre",
     "apellidosPadre","telefonoPadre","correoPadre","ocupacionPadre","empresaPadre","telefonoEmpresa",
-    "tokenPago","exalumno","correoFamiliar","tipoBeca","porcentajeBeca","actividad","nombreFactura",
+    "tokenPago","exalumno","correoFamiliar","actividad","nombreFactura",
     "calleNumeroFactura","coloniaFactura","estadoFactura","municipioFactura","codigoPostalFactura",
     "telefonoCasaFactura","emailFactura","rfc","numeroCuenta","tipoCobro","usoCfdi","requiereFactura",
     "calificaciones","general","cobros","nivel","grado","grupo","historialActividad",
-    // 🔹 agrega estos:
-    "hermanos","hermanoEstudiaAqui"
+    // hermanos
+    "hermanos","hermanoEstudiaAqui",
+    // ===== BECAS (nuevos, planos) =====
+    "tipoBeca","tipoBecaOtro","fuenteBeca","convenioEmpresa","patrocinador","folioBeca",
+    "porcentajeBeca","topeMensual","vigenciaInicio","vigenciaFin","aplicaA",
+    "estatusBeca","renovable","requiereServicio","horasServicio","promedioMinimo","observacionesBeca",
   ];
+
   const patch = {};
   for (const k of allowed) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) {
-      patch[k] = body[k];
-    }
+    if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
   }
   if (Object.prototype.hasOwnProperty.call(patch, "matricula")) delete patch.matricula;
 
-  // sanitiza historial si viene en el patch
+  // sanitiza estructuras
   if (Object.prototype.hasOwnProperty.call(patch, "historialActividad")) {
     patch.historialActividad = sanitizeHistorialActividad(patch.historialActividad);
   }
-  // 🔹 sanitiza hermanos si vienen
   if (Object.prototype.hasOwnProperty.call(patch, "hermanos")) {
-    patch.hermanos = sanitizeHermanos(patch.hermanos);
+    patch.hermanos = Array.isArray(patch.hermanos)
+      ? patch.hermanos.map(sanitizeHermano).filter(Boolean)
+      : [];
   }
   if (Object.prototype.hasOwnProperty.call(patch, "hermanoEstudiaAqui")) {
     patch.hermanoEstudiaAqui = Boolean(patch.hermanoEstudiaAqui);
   }
-  // fuerza número
   if (Object.prototype.hasOwnProperty.call(patch, "numeroHermanos")) {
     patch.numeroHermanos = Number.isFinite(Number(patch.numeroHermanos))
       ? Number(patch.numeroHermanos)
       : 0;
   }
 
+  // sanitiza todos los campos de beca en plano (solo si llegaron)
+  const becaFromBody = sanitizeBecaFlat({ ...patch, ...body });
+  for (const k of Object.keys(becaFromBody)) {
+    if (Object.prototype.hasOwnProperty.call(patch, k)) {
+      patch[k] = becaFromBody[k];
+    }
+  }
+
   return patch;
 }
 
 // ────────────────────────────────────────────────────────────────
-/** Endpoints */
+// Endpoints
 // ────────────────────────────────────────────────────────────────
 
-// META — versión, total, última actualización
+// META
 router.get("/meta", async (_req, res) => {
   try {
     const meta = await readMeta();
@@ -239,7 +340,7 @@ router.get("/meta", async (_req, res) => {
   }
 });
 
-// CHANGES — deltas desde un instante
+// CHANGES
 router.get("/changes", async (req, res) => {
   try {
     const since = String(req.query.since || "").trim();
@@ -251,22 +352,18 @@ router.get("/changes", async (req, res) => {
 
     const nowISO = new Date().toISOString();
 
-    // updated
     const qUpdated = await col
       .where("updatedAtTs", ">", sinceDate)
       .orderBy("updatedAtTs", "asc")
-      .limit(1000) // defensivo
+      .limit(1000)
       .get();
-
     const updated = qUpdated.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    // deleted — leemos tombstones
     const qDeleted = await tombstones
       .where("deletedAtTs", ">", sinceDate)
       .orderBy("deletedAtTs", "asc")
       .limit(1000)
       .get();
-
     const deleted = qDeleted.docs.map((d) => d.id);
 
     res.json({ ok: true, since, now: nowISO, updated, deleted });
@@ -275,39 +372,14 @@ router.get("/changes", async (req, res) => {
   }
 });
 
-// 🔎 BÚSQUEDA RÁPIDA (para Step3Hermanos) — DEBE IR ANTES DE "/:matricula"
+// 🔎 búsqueda ligera para hermanos
 router.get("/search", async (req, res) => {
   try {
     const term = String(req.query.term || "").trim();
     const limit = Math.min(Number(req.query.limit || 10), 50);
+    if (term.length < 2) return res.json({ ok: true, items: [] });
 
-    if (term.length < 2) {
-      return res.json({ ok: true, items: [] });
-    }
-
-    // 1) Prefijo por apellidos
-    let q1 = col
-      .orderBy("apellidos", "asc")
-      .orderBy(FieldPath.documentId(), "asc")
-      .startAt(term)
-      .endAt(term + "\uf8ff")
-      .limit(limit);
-    const snap1 = await q1.get();
-
-    // 2) Prefijo por nombres
-    let q2 = col
-      .orderBy("nombres", "asc")
-      .orderBy(FieldPath.documentId(), "asc")
-      .startAt(term)
-      .endAt(term + "\uf8ff")
-      .limit(limit);
-    const snap2 = await q2.get();
-
-    // 3) Match exacto por matrícula
-    const byMatricula = await col.doc(term).get();
-
-    const map = new Map();
-    const pushDoc = (d) => {
+    const push = (map, d) => {
       if (!d?.exists) return;
       const data = d.data() || {};
       map.set(d.id, {
@@ -316,13 +388,36 @@ router.get("/search", async (req, res) => {
         nombres: data.nombres || "",
         apellidos: data.apellidos || "",
         grupoPrincipal: data.grupoPrincipal || "",
-        nivel: data.nivel || "",
+        nivel: data.nivel || undefined,
+        grado: data.grado || undefined,
       });
     };
 
-    snap1.docs.forEach(pushDoc);
-    snap2.docs.forEach(pushDoc);
-    if (byMatricula.exists) pushDoc(byMatricula);
+    // por apellidos
+    let q1 = col
+      .orderBy("apellidos", "asc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .startAt(term)
+      .endAt(term + "\uf8ff")
+      .limit(limit);
+    const snap1 = await q1.get();
+
+    // por nombres
+    let q2 = col
+      .orderBy("nombres", "asc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .startAt(term)
+      .endAt(term + "\uf8ff")
+      .limit(limit);
+    const snap2 = await q2.get();
+
+    // matrícula exacta
+    const byId = await col.doc(term).get();
+
+    const map = new Map();
+    snap1.docs.forEach((d) => push(map, d));
+    snap2.docs.forEach((d) => push(map, d));
+    if (byId.exists) push(map, byId);
 
     const items = Array.from(map.values()).slice(0, limit);
     res.json({ ok: true, items });
@@ -331,39 +426,32 @@ router.get("/search", async (req, res) => {
   }
 });
 
-// Crear alumno
+// Crear
 router.post("/", async (req, res) => {
   try {
     const { f, nowISO } = toAlumnoPayload(req.body);
-    if (!f.matricula) {
-      return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
-    }
+    if (!f.matricula) return res.status(400).json({ ok: false, error: "La matrícula es obligatoria" });
 
     const ref = col.doc(f.matricula);
-    const snap = await ref.get();
-    if (snap.exists) {
+    if ((await ref.get()).exists) {
       return res.status(409).json({ ok: false, error: "La matrícula ya existe" });
     }
 
-    const data = { ...f, createdAt: nowISO, createdAtTs: admin.firestore.FieldValue.serverTimestamp() };
+    const data = {
+      ...f,
+      createdAt: nowISO,
+      createdAtTs: admin.firestore.FieldValue.serverTimestamp(),
+    };
 
-    // Alta automática si vino vacío
+    // auto-historial si viene vacío
     if (!Array.isArray(data.historialActividad) || data.historialActividad.length === 0) {
       data.historialActividad = [{
-        fechaIso: nowISO,
-        tipo: "alta",
-        motivo: "Alta inicial",
-        usuario: "sistema",
-        notas: ""
+        fechaIso: nowISO, tipo: "alta", motivo: "Alta inicial", usuario: "sistema", notas: ""
       }];
     }
 
     await ref.set(data);
-
-    // limpia tombstone si existía
     await tombstones.doc(ref.id).delete().catch(() => {});
-
-    // meta: +1 total, versión++
     await bumpMeta({ deltaTotal: +1, forceTouch: true });
 
     res.json({ ok: true, data: { id: ref.id, ...data } });
@@ -372,30 +460,22 @@ router.post("/", async (req, res) => {
   }
 });
 
-/**
- * Listar alumnos con búsqueda+cursor.
- * Devuelve ETag basado en meta.version y los parámetros.
- */
+// Listar (búsqueda y cursor)
 router.get("/", async (req, res) => {
   try {
     const pageSize = Math.min(Number(req.query.pageSize || 50), 100);
     const q = (req.query.q || "").toString().trim();
     const hasQ = q.length >= 2;
 
-    // cursores
     const saApellido = typeof req.query.saApellido === "string" ? req.query.saApellido : null;
     const saId       = typeof req.query.saId === "string" ? req.query.saId : null;
     const saNombre   = typeof req.query.saNombre === "string" ? req.query.saNombre : null;
     const saId2      = typeof req.query.saId2 === "string" ? req.query.saId2 : null;
 
-    // ETag (si versión no cambió y params tampoco, 304)
     const meta = await readMeta();
     const etag = `"alumnos:${meta.version}|q=${hasQ ? q : ""}|ps=${pageSize}|a=${saApellido || ""}|i=${saId || ""}|n=${saNombre || ""}|i2=${saId2 || ""}"`;
     const inm = req.headers["if-none-match"];
-    if (inm && inm === etag) {
-      res.status(304).end();
-      return;
-    }
+    if (inm && inm === etag) return res.status(304).end();
 
     let query;
     if (hasQ) {
@@ -406,19 +486,16 @@ router.get("/", async (req, res) => {
         .startAt(qNorm)
         .endAt(qNorm + "\uf8ff")
         .limit(pageSize);
-
       if (saNombre && saId2) query = query.startAfter(saNombre, saId2);
     } else {
       query = col
         .orderBy("apellidos", "asc")
         .orderBy(FieldPath.documentId(), "asc")
         .limit(pageSize);
-
       if (saApellido && saId) query = query.startAfter(saApellido, saId);
     }
 
     const snap = await query.get();
-
     const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     const lastDoc = snap.docs[snap.docs.length - 1] || null;
 
@@ -429,19 +506,13 @@ router.get("/", async (req, res) => {
       : null;
 
     res.setHeader("ETag", etag);
-    res.json({
-      ok: true,
-      items,
-      next,
-      total: meta.total, // evita count() por request
-      pageSize,
-    });
+    res.json({ ok: true, items, next, total: meta.total, pageSize });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Obtener alumno por matrícula
+// Obtener por matrícula
 router.get("/:matricula", async (req, res) => {
   try {
     const ref = col.doc(req.params.matricula);
@@ -453,7 +524,7 @@ router.get("/:matricula", async (req, res) => {
   }
 });
 
-// Patch (merge manual) + recalcular índices + sellos
+// Patch/merge (recalcula índices)
 router.patch("/:matricula", async (req, res) => {
   try {
     const id = req.params.matricula;
@@ -472,8 +543,6 @@ router.patch("/:matricula", async (req, res) => {
     finalData.updatedAtTs    = admin.firestore.FieldValue.serverTimestamp();
 
     await ref.set(finalData, { merge: false });
-
-    // meta: versión++
     await bumpMeta({ deltaTotal: 0, forceTouch: true });
 
     res.json({ ok: true, data: { id, ...finalData } });
@@ -482,15 +551,12 @@ router.patch("/:matricula", async (req, res) => {
   }
 });
 
-// Eliminar — crea tombstone y decrementa total
+// Eliminar
 router.delete("/:matricula", async (req, res) => {
   try {
     const id = req.params.matricula;
-
-    // borra doc
     await col.doc(id).delete();
 
-    // escribe tombstone
     const nowISO = new Date().toISOString();
     await tombstones.doc(id).set({
       id,
@@ -498,16 +564,14 @@ router.delete("/:matricula", async (req, res) => {
       deletedAtTs: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // meta: -1 total, versión++
     await bumpMeta({ deltaTotal: -1, forceTouch: true });
-
     res.json({ ok: true, id });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// Import masivo
+// Import masivo (opcional)
 router.post("/import", async (req, res) => {
   try {
     const dryRun = String(req.query.dryRun || "false").toLowerCase() === "true";
@@ -516,8 +580,7 @@ router.post("/import", async (req, res) => {
 
     let rows = [];
     if (req.is("text/csv")) {
-      const raw = req.body;
-      rows = parseCsv(raw, { columns: true, skip_empty_lines: true, trim: true });
+      rows = parseCsv(req.body, { columns: true, skip_empty_lines: true, trim: true });
     } else if (req.is("application/json")) {
       if (!Array.isArray(req.body)) {
         return res.status(400).json({ ok: false, error: "Se esperaba un arreglo JSON" });
@@ -539,14 +602,8 @@ router.post("/import", async (req, res) => {
         errors.push({ index: i, error: String(e), row: rows[i] });
       }
     }
-
-    if (errors.length) {
-      return res.status(400).json({ ok: false, errors, validCount: converted.length });
-    }
-
-    if (dryRun) {
-      return res.json({ ok: true, dryRun: true, count: converted.length });
-    }
+    if (errors.length) return res.status(400).json({ ok: false, errors, validCount: converted.length });
+    if (dryRun) return res.json({ ok: true, dryRun: true, count: converted.length });
 
     const BATCH_SIZE = 400;
     let written = 0;
@@ -573,15 +630,12 @@ router.post("/import", async (req, res) => {
         const correoIndex = strip(body.correoFamiliar || "");
         const nowISO = new Date().toISOString();
 
+        // TIP: si importas también becas, puedes pasar sanitizeBecaFlat(body) aquí
         const data = {
           ...body,
-          // asegura índices/sellos
           nombreIndex,
           matriculaIndex,
           correoIndex,
-          // 🔹 si vino hermanos/hermanoEstudiaAqui en el import, sanitiza:
-          hermanos: sanitizeHermanos(body.hermanos),
-          hermanoEstudiaAqui: Boolean(body.hermanoEstudiaAqui),
           updatedAt: nowISO,
           updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
           createdAt: nowISO,
@@ -595,7 +649,6 @@ router.post("/import", async (req, res) => {
           batch.set(ref, data, { merge: true });
         }
 
-        // limpia tombstone si existía
         batch.delete(tombstones.doc(matricula));
       }
 
@@ -603,9 +656,7 @@ router.post("/import", async (req, res) => {
       written += slice.length;
     }
 
-    // meta: versión++, y ajusta total (aprox)
     await bumpMeta({ deltaTotal, forceTouch: true });
-
     res.json({ ok: true, written });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
