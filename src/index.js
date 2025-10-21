@@ -2,49 +2,38 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+
 import alumnosRouter from "./routes/alumnos.js";
+import gruposRouter from "./routes/grupos.js"; // 👈 Asegúrate que este path y el nombre del archivo coinciden exacto (minúsculas)
+
 import { firestore } from "./firebase.js";
 
 const app = express();
 
-/* ===== CORS =====
- * Opción A: abierto (desarrollo/local)
- */
+// Log de arranque
+console.log("[BOOT] starting API…");
+
+// CORS
 app.use(cors());
 
-/* // Opción B: whitelist (prod)
-const whitelist = [
-  "http://localhost:5173",
-  "http://localhost:3000",
-  "http://localhost:4000",
-  "https://tu-frontend.prod.com"
-];
-app.use(
-  cors({
-    origin(origin, cb) {
-      // permite herramientas como curl / Postman sin origin
-      if (!origin || whitelist.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
-*/
-
-/* ===== Body parsers =====
- * JSON global (10–20MB por si importas JSON grande)
- */
+// Parsers
 app.use(express.json({ limit: "20mb" }));
-
-/* CSV SOLO para la ruta de import (evita interferir con otros endpoints)
- * Importante: este middleware debe ir ANTES de montar el router y scopeado a la ruta exacta.
- */
 app.use("/api/alumnos/import", express.text({ type: "text/csv", limit: "50mb" }));
 
-/* ===== Healthcheck ===== */
+// Healthchecks
 app.get("/", (_req, res) => res.json({ ok: true, message: "API Colegio" }));
 
-/* ===== Ruta de prueba Firestore ===== */
+// Ruta debug para saber qué build corre
+app.get("/__whoami", (_req, res) => {
+  res.json({
+    ok: true,
+    cwd: process.cwd(),
+    now: new Date().toISOString(),
+    message: "running src/index.js",
+  });
+});
+
+// Firestore test
 app.get("/db-test", async (_req, res) => {
   try {
     await firestore.collection("test").doc("server").set({ ok: true, at: new Date() });
@@ -55,19 +44,24 @@ app.get("/db-test", async (_req, res) => {
   }
 });
 
-/* ===== Rutas ===== */
+// ===== Rutas =====
+console.log("[BOOT] mounting /api/alumnos");
 app.use("/api/alumnos", alumnosRouter);
 
-/* ===== 404 y manejo de errores ===== */
+console.log("[BOOT] mounting /api/grupos");
+app.use("/api/grupos", gruposRouter); // 👈 aquí se monta
+
+// 404
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not Found" });
+  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
 });
 
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error("[UNCAUGHT ERROR]", err);
   res.status(500).json({ ok: false, error: String(err?.message || err) });
 });
 
-/* ===== Server ===== */
+// Server
 const PORT = Number(process.env.PORT || 4000);
 app.listen(PORT, () => console.log(`🚀 API on :${PORT}`));

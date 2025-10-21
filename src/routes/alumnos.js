@@ -1,4 +1,4 @@
-// routes/alumnos.js
+// src/routes/alumnos.js
 import { Router } from "express";
 import { firestore } from "../firebase.js";
 import { parse as parseCsv } from "csv-parse/sync";
@@ -32,7 +32,6 @@ async function bumpMeta({ deltaTotal = 0, forceTouch = true } = {}) {
 async function readMeta() {
   const snap = await metasDoc.get();
   if (!snap.exists) {
-    // Inicializa meta con total actual
     const agg = await col.count().get().catch(() => null);
     const total = agg ? agg.data().count : 0;
     const nowISO = new Date().toISOString();
@@ -53,7 +52,7 @@ async function readMeta() {
   };
 }
 
-// ── Historial de actividad: sanitizador ─────────────────────────
+// ── Sanitizadores ───────────────────────────────────────────────
 function sanitizeHistorialActividad(input) {
   if (!Array.isArray(input)) return [];
   const T = new Set(["alta", "baja", "cambio"]);
@@ -72,6 +71,23 @@ function sanitizeHistorialActividad(input) {
         usuario: clean(r?.usuario),
         notas: clean(r?.notas),
       };
+    })
+    .filter(Boolean);
+}
+
+/** Sanitiza array de hermanos (objetos planos con campos permitidos) */
+function sanitizeHermanos(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((h) => {
+      const id          = h?.id ? String(h.id).trim() : "";
+      const matricula   = h?.matricula ? String(h.matricula).trim() : "";
+      const nombres     = h?.nombres ? String(h.nombres).trim() : "";
+      const apellidos   = h?.apellidos ? String(h.apellidos).trim() : "";
+      const grupoPrin   = h?.grupoPrincipal ? String(h.grupoPrincipal).trim() : "";
+      const nivel       = h?.nivel ? String(h.nivel).trim() : "";
+      if (!id && !matricula) return null; // al menos uno para identificar
+      return { id, matricula, nombres, apellidos, grupoPrincipal: grupoPrin, nivel };
     })
     .filter(Boolean);
 }
@@ -105,7 +121,8 @@ function toAlumnoPayload(body) {
     telefonoCelular: body.telefonoCelular || "",
     contactoPrincipal: body.contactoPrincipal || "",
 
-    numeroHermanos: body.numeroHermanos || "",
+    // número seguro
+    numeroHermanos: Number.isFinite(Number(body.numeroHermanos)) ? Number(body.numeroHermanos) : 0,
 
     nombrePadre: body.nombrePadre || "",
     apellidosPadre: body.apellidosPadre || "",
@@ -148,6 +165,10 @@ function toAlumnoPayload(body) {
     // historial de actividad
     historialActividad: sanitizeHistorialActividad(body.historialActividad),
 
+    // 🔹 NUEVO: hermanos + flag
+    hermanos: sanitizeHermanos(body.hermanos),
+    hermanoEstudiaAqui: Boolean(body.hermanoEstudiaAqui),
+
     // índices normalizados
     nombreIndex: strip(`${body.nombres || ""} ${body.apellidos || ""}`),
     matriculaIndex: strip(body.matricula || ""),
@@ -171,7 +192,9 @@ function buildPatchFromBody(body) {
     "tokenPago","exalumno","correoFamiliar","tipoBeca","porcentajeBeca","actividad","nombreFactura",
     "calleNumeroFactura","coloniaFactura","estadoFactura","municipioFactura","codigoPostalFactura",
     "telefonoCasaFactura","emailFactura","rfc","numeroCuenta","tipoCobro","usoCfdi","requiereFactura",
-    "calificaciones","general","cobros","nivel","grado","grupo","historialActividad"
+    "calificaciones","general","cobros","nivel","grado","grupo","historialActividad",
+    // 🔹 agrega estos:
+    "hermanos","hermanoEstudiaAqui"
   ];
   const patch = {};
   for (const k of allowed) {
@@ -184,6 +207,19 @@ function buildPatchFromBody(body) {
   // sanitiza historial si viene en el patch
   if (Object.prototype.hasOwnProperty.call(patch, "historialActividad")) {
     patch.historialActividad = sanitizeHistorialActividad(patch.historialActividad);
+  }
+  // 🔹 sanitiza hermanos si vienen
+  if (Object.prototype.hasOwnProperty.call(patch, "hermanos")) {
+    patch.hermanos = sanitizeHermanos(patch.hermanos);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "hermanoEstudiaAqui")) {
+    patch.hermanoEstudiaAqui = Boolean(patch.hermanoEstudiaAqui);
+  }
+  // fuerza número
+  if (Object.prototype.hasOwnProperty.call(patch, "numeroHermanos")) {
+    patch.numeroHermanos = Number.isFinite(Number(patch.numeroHermanos))
+      ? Number(patch.numeroHermanos)
+      : 0;
   }
 
   return patch;
@@ -234,6 +270,62 @@ router.get("/changes", async (req, res) => {
     const deleted = qDeleted.docs.map((d) => d.id);
 
     res.json({ ok: true, since, now: nowISO, updated, deleted });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// 🔎 BÚSQUEDA RÁPIDA (para Step3Hermanos) — DEBE IR ANTES DE "/:matricula"
+router.get("/search", async (req, res) => {
+  try {
+    const term = String(req.query.term || "").trim();
+    const limit = Math.min(Number(req.query.limit || 10), 50);
+
+    if (term.length < 2) {
+      return res.json({ ok: true, items: [] });
+    }
+
+    // 1) Prefijo por apellidos
+    let q1 = col
+      .orderBy("apellidos", "asc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .startAt(term)
+      .endAt(term + "\uf8ff")
+      .limit(limit);
+    const snap1 = await q1.get();
+
+    // 2) Prefijo por nombres
+    let q2 = col
+      .orderBy("nombres", "asc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .startAt(term)
+      .endAt(term + "\uf8ff")
+      .limit(limit);
+    const snap2 = await q2.get();
+
+    // 3) Match exacto por matrícula
+    const byMatricula = await col.doc(term).get();
+
+    const map = new Map();
+    const pushDoc = (d) => {
+      if (!d?.exists) return;
+      const data = d.data() || {};
+      map.set(d.id, {
+        id: d.id,
+        matricula: d.id,
+        nombres: data.nombres || "",
+        apellidos: data.apellidos || "",
+        grupoPrincipal: data.grupoPrincipal || "",
+        nivel: data.nivel || "",
+      });
+    };
+
+    snap1.docs.forEach(pushDoc);
+    snap2.docs.forEach(pushDoc);
+    if (byMatricula.exists) pushDoc(byMatricula);
+
+    const items = Array.from(map.values()).slice(0, limit);
+    res.json({ ok: true, items });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
@@ -341,8 +433,7 @@ router.get("/", async (req, res) => {
       ok: true,
       items,
       next,
-      // usa meta.total (evitas count() por request)
-      total: meta.total,
+      total: meta.total, // evita count() por request
       pageSize,
     });
   } catch (e) {
@@ -484,14 +575,17 @@ router.post("/import", async (req, res) => {
 
         const data = {
           ...body,
+          // asegura índices/sellos
           nombreIndex,
           matriculaIndex,
           correoIndex,
+          // 🔹 si vino hermanos/hermanoEstudiaAqui en el import, sanitiza:
+          hermanos: sanitizeHermanos(body.hermanos),
+          hermanoEstudiaAqui: Boolean(body.hermanoEstudiaAqui),
           updatedAt: nowISO,
           updatedAtTs: admin.firestore.FieldValue.serverTimestamp(),
           createdAt: nowISO,
           createdAtTs: admin.firestore.FieldValue.serverTimestamp(),
-          // si body tiene historialActividad, idealmente ya venga limpio desde toAlumnoPayload/map
         };
 
         if (!merge) {
@@ -499,8 +593,6 @@ router.post("/import", async (req, res) => {
           deltaTotal += 1;
         } else {
           batch.set(ref, data, { merge: true });
-          // si no existía antes, contará como +1 — para simplicidad,
-          // puedes recalcular total al final si prefieres exactitud.
         }
 
         // limpia tombstone si existía
@@ -511,7 +603,7 @@ router.post("/import", async (req, res) => {
       written += slice.length;
     }
 
-    // meta: versión++, y ajusta total (aprox) — o recalcula total usando count()
+    // meta: versión++, y ajusta total (aprox)
     await bumpMeta({ deltaTotal, forceTouch: true });
 
     res.json({ ok: true, written });
