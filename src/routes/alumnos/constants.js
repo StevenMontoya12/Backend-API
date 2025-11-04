@@ -21,6 +21,9 @@ export const PATCH_ALLOWED = new Set([
   "tipoBeca","tipoBecaOtro","fuenteBeca","convenioEmpresa","patrocinador","folioBeca",
   "porcentajeBeca","topeMensual","vigenciaInicio","vigenciaFin","aplicaA",
   "estatusBeca","renovable","requiereServicio","horasServicio","promedioMinimo","observacionesBeca",
+
+  // 👇 NUEVO
+  "contactosFamilia",
 ]);
 
 export const TIPO_HIST_SET = new Set(["alta","baja","cambio"]);
