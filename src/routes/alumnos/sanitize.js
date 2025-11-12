@@ -16,22 +16,29 @@ export function cleanStr(v) {
 
 /* ──────────────────────────────────────────────────────────
  * HERMANOS
- * Estructura esperada (flexible): { nombre, apellidos, nivel, grado, grupo, estudiaAqui? }
+ * Estructura esperada (flexible): { matricula?, id?, nombre|nombres, apellidos, nivel, grado, grupo, estudiaAqui? }
  * ────────────────────────────────────────────────────────── */
 export function sanitizeHermano(x = {}) {
   if (!x || typeof x !== "object") return null;
 
+  // ✅ Asegurar que PERSISTIMOS matricula (con fallback a id)
+  const matricula = cleanStr(x.matricula || x.id || "");
+
+  // Acepta "nombre" o "nombres" como fuente del nombre
   const nombre = cleanStr(x.nombre || x.nombres || "");
   const apellidos = cleanStr(x.apellidos || "");
   const nivel = cleanStr(x.nivel || "");
   const grado = cleanStr(x.grado || "");
   const grupo = cleanStr(x.grupo || "");
-  const estudiaAqui = Boolean(x.estudiaAqui);
+  const estudiaAqui = Boolean(x.estudiaAqui || x.hermanoEstudiaAqui);
 
-  // Requerimos al menos nombre o apellidos para conservarlo
-  if (!nombre && !apellidos) return null;
+  // Requerimos al menos algo significativo: nombre, apellidos o matricula
+  if (!nombre && !apellidos && !matricula) return null;
 
   return {
+    // 👇 Se guarda explícitamente la matrícula para que el front la vea al volver a leer
+    matricula,
+    // Mantén la clave "nombre" porque así la estás guardando en Firestore
     nombre,
     apellidos,
     nivel,

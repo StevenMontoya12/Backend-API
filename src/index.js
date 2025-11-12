@@ -4,7 +4,8 @@ import express from "express";
 import cors from "cors";
 
 import alumnosRouter from "./routes/alumnos.js";
-import gruposRouter from "./routes/grupos.js"; // 👈 Asegúrate que este path y el nombre del archivo coinciden exacto (minúsculas)
+import gruposRouter from "./routes/grupos.js";
+import colaboradoresRouter from "./routes/colaboradores.js";
 
 import { firestore } from "./firebase.js";
 
@@ -20,7 +21,7 @@ app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 app.use("/api/alumnos/import", express.text({ type: "text/csv", limit: "50mb" }));
 
-// Healthchecks
+// Healthcheck
 app.get("/", (_req, res) => res.json({ ok: true, message: "API Colegio" }));
 
 // Ruta debug para saber qué build corre
@@ -49,7 +50,10 @@ console.log("[BOOT] mounting /api/alumnos");
 app.use("/api/alumnos", alumnosRouter);
 
 console.log("[BOOT] mounting /api/grupos");
-app.use("/api/grupos", gruposRouter); // 👈 aquí se monta
+app.use("/api/grupos", gruposRouter);
+
+console.log("[BOOT] mounting /api/colaboradores");
+app.use("/api/colaboradores", colaboradoresRouter);
 
 // 404
 app.use((req, res) => {
@@ -62,6 +66,26 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ ok: false, error: String(err?.message || err) });
 });
 
-// Server
+// ===== Server =====
 const PORT = Number(process.env.PORT || 4000);
-app.listen(PORT, () => console.log(`🚀 API on :${PORT}`));
+const HOST = "0.0.0.0"; // <- escucha en toda la red local
+
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 API disponible en:`);
+  console.log(`→ Local:   http://localhost:${PORT}`);
+  console.log(`→ Red LAN: http://${getLocalIP()}:${PORT}`);
+});
+
+// Función auxiliar para mostrar tu IP local automáticamente
+import os from "os";
+function getLocalIP() {
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      if (net.family === "IPv4" && !net.internal) {
+        return net.address;
+      }
+    }
+  }
+  return "unknown";
+}
