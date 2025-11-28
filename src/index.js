@@ -6,6 +6,7 @@ import cors from "cors";
 import alumnosRouter from "./routes/alumnos.js";
 import gruposRouter from "./routes/grupos.js";
 import colaboradoresRouter from "./routes/colaboradores.js";
+import curriculoRouter from "./routes/curriculo.js";   // ⬅️ NUEVO
 
 import { firestore } from "./firebase.js";
 
@@ -19,12 +20,17 @@ app.use(cors());
 
 // Parsers
 app.use(express.json({ limit: "20mb" }));
-app.use("/api/alumnos/import", express.text({ type: "text/csv", limit: "50mb" }));
+app.use(
+  "/api/alumnos/import",
+  express.text({ type: "text/csv", limit: "50mb" })
+);
 
 // Healthcheck
-app.get("/", (_req, res) => res.json({ ok: true, message: "API Colegio" }));
+app.get("/", (_req, res) =>
+  res.json({ ok: true, message: "API Colegio" })
+);
 
-// Ruta debug para saber qué build corre
+// Ruta debug
 app.get("/__whoami", (_req, res) => {
   res.json({
     ok: true,
@@ -37,7 +43,10 @@ app.get("/__whoami", (_req, res) => {
 // Firestore test
 app.get("/db-test", async (_req, res) => {
   try {
-    await firestore.collection("test").doc("server").set({ ok: true, at: new Date() });
+    await firestore
+      .collection("test")
+      .doc("server")
+      .set({ ok: true, at: new Date() });
     res.json({ ok: true });
   } catch (e) {
     console.error("[/db-test] error:", e);
@@ -55,20 +64,27 @@ app.use("/api/grupos", gruposRouter);
 console.log("[BOOT] mounting /api/colaboradores");
 app.use("/api/colaboradores", colaboradoresRouter);
 
+console.log("[BOOT] mounting /api/curriculo");     // ⬅️ NUEVO
+app.use("/api/curriculo", curriculoRouter);        // ⬅️ NUEVO
+
 // 404
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
+  res
+    .status(404)
+    .json({ ok: false, error: "Not Found", path: req.path });
 });
 
 // Error handler
 app.use((err, _req, res, _next) => {
   console.error("[UNCAUGHT ERROR]", err);
-  res.status(500).json({ ok: false, error: String(err?.message || err) });
+  res
+    .status(500)
+    .json({ ok: false, error: String(err?.message || err) });
 });
 
 // ===== Server =====
 const PORT = Number(process.env.PORT || 4000);
-const HOST = "0.0.0.0"; // <- escucha en toda la red local
+const HOST = "0.0.0.0";
 
 app.listen(PORT, HOST, () => {
   console.log(`🚀 API disponible en:`);
@@ -76,7 +92,7 @@ app.listen(PORT, HOST, () => {
   console.log(`→ Red LAN: http://${getLocalIP()}:${PORT}`);
 });
 
-// Función auxiliar para mostrar tu IP local automáticamente
+// Función auxiliar para mostrar IP local
 import os from "os";
 function getLocalIP() {
   const nets = os.networkInterfaces();

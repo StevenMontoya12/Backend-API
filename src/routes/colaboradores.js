@@ -33,35 +33,35 @@ const pickColaborador = (body) => {
   const out = {};
 
   // ===== Laboral
-  out.nombres              = clampStr(body.nombres);
-  out.apellidoPaterno      = clampStr(body.apellidoPaterno);
-  out.apellidoMaterno      = clampStr(body.apellidoMaterno);
-  out.nombrePreferido      = clampStr(body.nombrePreferido);
-  out.correoInstitucional  = clampStr(body.correoInstitucional);
-  out.noEmpleado           = clampStr(body.noEmpleado);
-  out.posicion             = clampStr(body.posicion);
-  out.categoriaPuesto      = clampStr(body.categoriaPuesto);
-  out.esquemaTrabajo       = clampStr(body.esquemaTrabajo);
-  out.horasTrabajo         = Number(body.horasTrabajo ?? 0);
-  out.extension            = clampStr(body.extension);
-  out.jefeInmediato        = clampStr(body.jefeInmediato);
-  out.director             = clampStr(body.director);
-  out.direccion            = clampStr(body.direccion);
-  out.fechaIngreso         = clampStr(body.fechaIngreso);
-  out.fechaBaja            = clampStr(body.fechaBaja);
-  out.estatus              = clampStr(body.estatus ?? "Activo");
+  out.nombres             = clampStr(body.nombres);
+  out.apellidoPaterno     = clampStr(body.apellidoPaterno);
+  out.apellidoMaterno     = clampStr(body.apellidoMaterno);
+  out.nombrePreferido     = clampStr(body.nombrePreferido);
+  out.correoInstitucional = clampStr(body.correoInstitucional);
+  out.noEmpleado          = clampStr(body.noEmpleado);
+  out.posicion            = clampStr(body.posicion);
+  out.categoriaPuesto     = clampStr(body.categoriaPuesto);
+  out.esquemaTrabajo      = clampStr(body.esquemaTrabajo);
+  out.horasTrabajo        = Number(body.horasTrabajo ?? 0);
+  out.extension           = clampStr(body.extension);
+  out.jefeInmediato       = clampStr(body.jefeInmediato);
+  out.director            = clampStr(body.director);
+  out.direccion           = clampStr(body.direccion);
+  out.fechaIngreso        = clampStr(body.fechaIngreso);
+  out.fechaBaja           = clampStr(body.fechaBaja);
+  out.estatus             = clampStr(body.estatus ?? "Activo");
 
   // ===== Personales
-  out.fechaNacimiento      = clampStr(body.fechaNacimiento);
-  out.nss                  = clampStr(body.nss);
-  out.curp                 = clampStr(body.curp);
-  out.rfc                  = clampStr(body.rfc);
-  out.genero               = clampStr(body.genero);
-  out.estadoCivil          = clampStr(body.estadoCivil);
-  out.gradoEstudios        = clampStr(body.gradoEstudios);
-  out.tallaCamisa          = clampStr(body.tallaCamisa);
-  out.pasatiempos          = clampStr(body.pasatiempos, 2000);
-  out.pastelFavorito       = clampStr(body.pastelFavorito);
+  out.fechaNacimiento = clampStr(body.fechaNacimiento);
+  out.nss             = clampStr(body.nss);
+  out.curp            = clampStr(body.curp);
+  out.rfc             = clampStr(body.rfc);
+  out.genero          = clampStr(body.genero);
+  out.estadoCivil     = clampStr(body.estadoCivil);
+  out.gradoEstudios   = clampStr(body.gradoEstudios);
+  out.tallaCamisa     = clampStr(body.tallaCamisa);
+  out.pasatiempos     = clampStr(body.pasatiempos, 2000);
+  out.pastelFavorito  = clampStr(body.pastelFavorito);
 
   // ===== Médicos
   out.tipoSangre           = clampStr(body.tipoSangre);
@@ -87,14 +87,14 @@ const pickColaborador = (body) => {
     : [];
 
   // ===== Contacto
-  out.telCel            = clampStr(body.telCel);
-  out.telCasa           = clampStr(body.telCasa);
-  out.emailPersonal     = clampStr(body.emailPersonal);
-  out.calleNumero       = clampStr(body.calleNumero);
-  out.colonia           = clampStr(body.colonia);
-  out.codigoPostal      = clampStr(body.codigoPostal);
-  out.estado            = clampStr(body.estado);
-  out.municipio         = clampStr(body.municipio);
+  out.telCel        = clampStr(body.telCel);
+  out.telCasa       = clampStr(body.telCasa);
+  out.emailPersonal = clampStr(body.emailPersonal);
+  out.calleNumero   = clampStr(body.calleNumero);
+  out.colonia       = clampStr(body.colonia);
+  out.codigoPostal  = clampStr(body.codigoPostal);
+  out.estado        = clampStr(body.estado);
+  out.municipio     = clampStr(body.municipio);
   out.contactosEmergencia = Array.isArray(body.contactosEmergencia)
     ? body.contactosEmergencia.map((c) => ({
         nombre: clampStr(c.nombre),
@@ -103,7 +103,7 @@ const pickColaborador = (body) => {
       }))
     : [];
 
-  // ===== Familia (nuevo step)
+  // ===== Familia
   if (Array.isArray(body.familia)) {
     out.familia = body.familia.map((m) => ({
       nombre: clampStr(m.nombre),
@@ -116,6 +116,18 @@ const pickColaborador = (body) => {
     }));
   }
 
+  // ===== Dependientes
+  if (Array.isArray(body.dependientes)) {
+    out.dependientes = body.dependientes.map((d) => ({
+      nombres: clampStr(d.nombres),
+      aPaterno: clampStr(d.aPaterno),
+      aMaterno: clampStr(d.aMaterno),
+      fechaNacIso: clampStr(d.fechaNacIso),
+      parentesco: clampStr(d.parentesco),
+      estudiante: !!d.estudiante,
+    }));
+  }
+
   // ===== Documentos (solo metadatos)
   if (isPlainObj(body.documentos)) {
     const docOut = {};
@@ -124,7 +136,9 @@ const pickColaborador = (body) => {
         fileName: clampStr(v?.fileName),
         mime: clampStr(v?.mime),
         size: Number(v?.size ?? 0),
-        status: ["ok", "faltante", "revisar"].includes(v?.status) ? v.status : "faltante",
+        status: ["ok", "faltante", "revisar"].includes(v?.status)
+          ? v.status
+          : "faltante",
       };
     }
     out.documentos = docOut;
@@ -140,28 +154,69 @@ const pickColaborador = (body) => {
    Rutas CRUD
    ================ */
 
-// GET /api/colaboradores?limit=20&cursor=xxxxx
+/**
+ * GET /api/colaboradores
+ * ?limit=50
+ * ?q=texto         → filtro por nombre/apellidos/correo
+ * ?onlyDocentes=1  → preferentemente registros cuyo puesto incluya "docente"
+ */
 router.get("/", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 20), 100);
-    const coll = firestore.collection(COL).orderBy("noEmpleado", "asc").limit(limit);
+    const limit = Math.min(Number(req.query.limit || 20), 200);
+    const qText = String(req.query.q || "").trim();
 
-    let snap;
-    if (req.query.cursor) {
-      const cursorDoc = await firestore.collection(COL).doc(String(req.query.cursor)).get();
-      if (!cursorDoc.exists) {
-        return res.status(400).json({ ok: false, error: "Cursor inválido" });
-      }
-      snap = await coll.startAfter(cursorDoc).get();
-    } else {
-      snap = await coll.get();
+    const onlyDocentesRaw = String(req.query.onlyDocentes || "").toLowerCase();
+    const onlyDocentes =
+      onlyDocentesRaw === "1" ||
+      onlyDocentesRaw === "true" ||
+      onlyDocentesRaw === "yes";
+
+    const snap = await firestore
+      .collection(COL)
+      .orderBy("apellidoPaterno", "asc")
+      .limit(limit)
+      .get();
+
+    let items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    const norm = (s = "") =>
+      s
+        .toString()
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")
+        .toLowerCase();
+
+    // 🔎 filtro por texto libre
+    if (qText) {
+      const nq = norm(qText);
+      items = items.filter((c) => {
+        const blobs = [
+          c.nombres,
+          c.apellidoPaterno,
+          c.apellidoMaterno,
+          c.nombrePreferido,
+          c.correoInstitucional,
+          c.noEmpleado,
+        ];
+        return blobs.some((b) => norm(b).includes(nq));
+      });
     }
 
-    const items = [];
-    snap.forEach((d) => items.push({ id: d.id, ...d.data() }));
-    const last = snap.docs[snap.docs.length - 1] || null;
+    // 🔹 solo docentes (por posicion / categoriaPuesto)
+    if (onlyDocentes) {
+      const filtrados = items.filter((c) => {
+        const pos = (c.posicion || "").toString().toLowerCase();
+        const cat = (c.categoriaPuesto || "").toString().toLowerCase();
+        return pos.includes("docente") || cat.includes("docente");
+      });
 
-    res.json({ ok: true, items, nextCursor: last ? last.id : null });
+      // Si no hay ninguno marcado como docente, devolvemos todos
+      if (filtrados.length > 0) {
+        items = filtrados;
+      }
+    }
+
+    res.json({ ok: true, items, nextCursor: null });
   } catch (e) {
     console.error("[GET /colaboradores] error:", e);
     res.status(500).json({ ok: false, error: String(e) });
@@ -172,7 +227,9 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const d = await firestore.collection(COL).doc(req.params.id).get();
-    if (!d.exists) return res.status(404).json({ ok: false, error: "No encontrado" });
+    if (!d.exists) {
+      return res.status(404).json({ ok: false, error: "No encontrado" });
+    }
     res.json({ ok: true, item: { id: d.id, ...d.data() } });
   } catch (e) {
     console.error("[GET /colaboradores/:id] error:", e);
@@ -183,26 +240,29 @@ router.get("/:id", async (req, res) => {
 // POST /api/colaboradores
 router.post("/", async (req, res) => {
   try {
-    // Normaliza y luego elimina undefined
     const raw = pickColaborador(req.body);
     const data = stripUndefinedDeep(raw);
 
-    // Reglas mínimas
     if (!data.noEmpleado) {
-      return res.status(400).json({ ok: false, error: "noEmpleado es requerido" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "noEmpleado es requerido" });
     }
     if (!data.posicion) {
-      return res.status(400).json({ ok: false, error: "posicion es requerida" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "posicion es requerida" });
     }
 
-    // Evitar duplicados por noEmpleado
     const dup = await firestore
       .collection(COL)
       .where("noEmpleado", "==", data.noEmpleado)
       .limit(1)
       .get();
     if (!dup.empty) {
-      return res.status(409).json({ ok: false, error: "noEmpleado ya existe" });
+      return res
+        .status(409)
+        .json({ ok: false, error: "noEmpleado ya existe" });
     }
 
     data.createdAt = new Date();
@@ -216,7 +276,7 @@ router.post("/", async (req, res) => {
   }
 });
 
-// PUT /api/colaboradores/:id  (reemplazo total controlado)
+// PUT /api/colaboradores/:id
 router.put("/:id", async (req, res) => {
   try {
     const raw = pickColaborador(req.body);
@@ -231,7 +291,7 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-// PATCH /api/colaboradores/:id  (merge controlado)
+// PATCH /api/colaboradores/:id
 router.patch("/:id", async (req, res) => {
   try {
     const raw = pickColaborador(req.body);
