@@ -6,9 +6,11 @@ import cors from "cors";
 import alumnosRouter from "./routes/alumnos.js";
 import gruposRouter from "./routes/grupos.js";
 import colaboradoresRouter from "./routes/colaboradores.js";
-import curriculoRouter from "./routes/curriculo.js";   // ⬅️ NUEVO
+import curriculoRouter from "./routes/curriculo.js";
+import authRouter from "./routes/auth.js";
 
 import { firestore } from "./firebase.js";
+import os from "os";
 
 const app = express();
 
@@ -54,7 +56,10 @@ app.get("/db-test", async (_req, res) => {
   }
 });
 
-// ===== Rutas =====
+// ===== Rutas (SOLO AQUÍ, una vez) =====
+console.log("[BOOT] mounting /api/auth");
+app.use("/api/auth", authRouter);
+
 console.log("[BOOT] mounting /api/alumnos");
 app.use("/api/alumnos", alumnosRouter);
 
@@ -64,17 +69,17 @@ app.use("/api/grupos", gruposRouter);
 console.log("[BOOT] mounting /api/colaboradores");
 app.use("/api/colaboradores", colaboradoresRouter);
 
-console.log("[BOOT] mounting /api/curriculo");     // ⬅️ NUEVO
-app.use("/api/curriculo", curriculoRouter);        // ⬅️ NUEVO
+console.log("[BOOT] mounting /api/curriculo");
+app.use("/api/curriculo", curriculoRouter);
 
-// 404
+// 404 (DESPUÉS de todas las rutas)
 app.use((req, res) => {
   res
     .status(404)
     .json({ ok: false, error: "Not Found", path: req.path });
 });
 
-// Error handler
+// Error handler (al final)
 app.use((err, _req, res, _next) => {
   console.error("[UNCAUGHT ERROR]", err);
   res
@@ -93,11 +98,10 @@ app.listen(PORT, HOST, () => {
 });
 
 // Función auxiliar para mostrar IP local
-import os from "os";
 function getLocalIP() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
+    for (const net of nets[name] || []) {
       if (net.family === "IPv4" && !net.internal) {
         return net.address;
       }

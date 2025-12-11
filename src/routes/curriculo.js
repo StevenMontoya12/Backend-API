@@ -30,6 +30,44 @@ function stripUndefinedDeep(value) {
   return value;
 }
 
+// Construye el objeto `evaluacion` a partir del body
+function buildEvaluacion(raw = {}, fallbackTipoCalificacion) {
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const ev = {};
+
+  // Trimestres activos (checkboxes)
+  ev.trim1 = !!raw.trim1;
+  ev.trim2 = !!raw.trim2;
+  ev.trim3 = !!raw.trim3;
+
+  // tipo de calificación dentro de evaluacion
+  let tipo =
+    (raw.tipo ||
+      raw.tipoCalificacion ||
+      fallbackTipoCalificacion ||
+      "numerica") + "";
+  tipo = tipo.toLowerCase();
+  if (tipo !== "letras") tipo = "numerica";
+  ev.tipo = tipo;
+
+  // Pesos de cada trimestre
+  const pesosRaw = raw.pesos || {};
+  const numOrNull = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  ev.pesos = {
+    trim1: numOrNull(pesosRaw.trim1),
+    trim2: numOrNull(pesosRaw.trim2),
+    trim3: numOrNull(pesosRaw.trim3),
+  };
+
+  return ev;
+}
+
 function pickAsignatura(body = {}) {
   const out = {};
 
@@ -53,6 +91,9 @@ function pickAsignatura(body = {}) {
   // otros campos
   out.objetivos = clampStr(body.objetivos, 2000);
 
+  // 🔹 tipo de calificación "general" (por materia)
+  out.tipoCalificacion = clampStr(body.tipoCalificacion, 50);
+
   // número de sesiones (opcional)
   if (body.sesiones !== undefined && body.sesiones !== null) {
     const n = Number(body.sesiones);
@@ -63,6 +104,13 @@ function pickAsignatura(body = {}) {
   out.orden = Number.isFinite(Number(body.orden))
     ? Number(body.orden)
     : 0;
+
+  // 🔹 Configuración de evaluación (trimestres + pesos)
+  // Solo aplica a asignaturas, no a áreas
+  if (!out.esArea && body.evaluacion && typeof body.evaluacion === "object") {
+    const ev = buildEvaluacion(body.evaluacion, out.tipoCalificacion);
+    if (ev) out.evaluacion = ev;
+  }
 
   return out;
 }
@@ -203,6 +251,12 @@ router.patch("/:id", async (req, res) => {
     if (typeof body.objetivos === "string") {
       data.objetivos = clampStr(body.objetivos, 2000);
     }
+
+    // 🔹 tipoCalificacion general
+    if (typeof body.tipoCalificacion === "string") {
+      data.tipoCalificacion = clampStr(body.tipoCalificacion, 50);
+    }
+
     // orden
     if (body.orden !== undefined && body.orden !== null) {
       const n = Number(body.orden);
@@ -212,6 +266,15 @@ router.patch("/:id", async (req, res) => {
     if (body.sesiones !== undefined && body.sesiones !== null) {
       const n = Number(body.sesiones);
       if (Number.isFinite(n)) data.sesiones = n;
+    }
+
+    // 🔹 evaluacion (trimestres + pesos)
+    if (body.evaluacion && typeof body.evaluacion === "object") {
+      const current = snap.data() || {};
+      const fallbackTipo =
+        body.tipoCalificacion || current.tipoCalificacion || "numerica";
+      const ev = buildEvaluacion(body.evaluacion, fallbackTipo);
+      if (ev) data.evaluacion = ev;
     }
 
     const cleaned = stripUndefinedDeep(data);
