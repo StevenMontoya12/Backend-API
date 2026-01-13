@@ -2,15 +2,16 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import os from "os";
 
 import alumnosRouter from "./routes/alumnos.js";
 import gruposRouter from "./routes/grupos.js";
 import colaboradoresRouter from "./routes/colaboradores.js";
 import curriculoRouter from "./routes/curriculo.js";
 import authRouter from "./routes/auth.js";
+import reportesRouter from "./routes/reportes.js"; // ✅ NUEVO
 
 import { firestore } from "./firebase.js";
-import os from "os";
 
 const app = express();
 
@@ -28,9 +29,7 @@ app.use(
 );
 
 // Healthcheck
-app.get("/", (_req, res) =>
-  res.json({ ok: true, message: "API Colegio" })
-);
+app.get("/", (_req, res) => res.json({ ok: true, message: "API Colegio" }));
 
 // Ruta debug
 app.get("/__whoami", (_req, res) => {
@@ -72,19 +71,19 @@ app.use("/api/colaboradores", colaboradoresRouter);
 console.log("[BOOT] mounting /api/curriculo");
 app.use("/api/curriculo", curriculoRouter);
 
+// ✅ NUEVO: Reporte Diario (global)
+console.log("[BOOT] mounting /api/reportes");
+app.use("/api/reportes", reportesRouter);
+
 // 404 (DESPUÉS de todas las rutas)
 app.use((req, res) => {
-  res
-    .status(404)
-    .json({ ok: false, error: "Not Found", path: req.path });
+  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
 });
 
 // Error handler (al final)
 app.use((err, _req, res, _next) => {
   console.error("[UNCAUGHT ERROR]", err);
-  res
-    .status(500)
-    .json({ ok: false, error: String(err?.message || err) });
+  res.status(500).json({ ok: false, error: String(err?.message || err) });
 });
 
 // ===== Server =====
@@ -102,9 +101,7 @@ function getLocalIP() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
     for (const net of nets[name] || []) {
-      if (net.family === "IPv4" && !net.internal) {
-        return net.address;
-      }
+      if (net.family === "IPv4" && !net.internal) return net.address;
     }
   }
   return "unknown";
