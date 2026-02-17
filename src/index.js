@@ -9,29 +9,23 @@ import gruposRouter from "./routes/grupos.js";
 import colaboradoresRouter from "./routes/colaboradores.js";
 import curriculoRouter from "./routes/curriculo.js";
 import authRouter from "./routes/auth.js";
-import reportesRouter from "./routes/reportes.js"; // ✅ NUEVO
+import reportesRouter from "./routes/reportes.js";
+import pushRouter from "./routes/push.js";
+import qrRouter from "./routes/qr.js";
+import oficiosRouter from "./routes/oficios.js"; // ✅ NUEVO
 
 import { firestore } from "./firebase.js";
 
 const app = express();
 
-// Log de arranque
 console.log("[BOOT] starting API…");
 
-// CORS
 app.use(cors());
-
-// Parsers
 app.use(express.json({ limit: "20mb" }));
-app.use(
-  "/api/alumnos/import",
-  express.text({ type: "text/csv", limit: "50mb" })
-);
+app.use("/api/alumnos/import", express.text({ type: "text/csv", limit: "50mb" }));
 
-// Healthcheck
 app.get("/", (_req, res) => res.json({ ok: true, message: "API Colegio" }));
 
-// Ruta debug
 app.get("/__whoami", (_req, res) => {
   res.json({
     ok: true,
@@ -41,13 +35,9 @@ app.get("/__whoami", (_req, res) => {
   });
 });
 
-// Firestore test
 app.get("/db-test", async (_req, res) => {
   try {
-    await firestore
-      .collection("test")
-      .doc("server")
-      .set({ ok: true, at: new Date() });
+    await firestore.collection("test").doc("server").set({ ok: true, at: new Date() });
     res.json({ ok: true });
   } catch (e) {
     console.error("[/db-test] error:", e);
@@ -55,7 +45,6 @@ app.get("/db-test", async (_req, res) => {
   }
 });
 
-// ===== Rutas (SOLO AQUÍ, una vez) =====
 console.log("[BOOT] mounting /api/auth");
 app.use("/api/auth", authRouter);
 
@@ -71,22 +60,28 @@ app.use("/api/colaboradores", colaboradoresRouter);
 console.log("[BOOT] mounting /api/curriculo");
 app.use("/api/curriculo", curriculoRouter);
 
-// ✅ NUEVO: Reporte Diario (global)
 console.log("[BOOT] mounting /api/reportes");
 app.use("/api/reportes", reportesRouter);
 
-// 404 (DESPUÉS de todas las rutas)
+console.log("[BOOT] mounting /api/push");
+app.use("/api/push", pushRouter);
+
+console.log("[BOOT] mounting /api/qr");
+app.use("/api/qr", qrRouter);
+
+// ✅ NUEVO: Oficios
+console.log("[BOOT] mounting /api/oficios");
+app.use("/api/oficios", oficiosRouter);
+
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not Found", path: req.path });
 });
 
-// Error handler (al final)
 app.use((err, _req, res, _next) => {
   console.error("[UNCAUGHT ERROR]", err);
   res.status(500).json({ ok: false, error: String(err?.message || err) });
 });
 
-// ===== Server =====
 const PORT = Number(process.env.PORT || 4000);
 const HOST = "0.0.0.0";
 
@@ -96,7 +91,6 @@ app.listen(PORT, HOST, () => {
   console.log(`→ Red LAN: http://${getLocalIP()}:${PORT}`);
 });
 
-// Función auxiliar para mostrar IP local
 function getLocalIP() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {

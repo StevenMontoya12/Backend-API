@@ -7,6 +7,20 @@ const router = Router();
 
 const JWT_SECRET = process.env.AUTH_JWT_SECRET || "cambia-esto-en-produccion";
 
+// helper: sacar "id lógico" del alumno (preferimos matrícula)
+function alumnoIdFromDoc(doc) {
+  const data = doc.data() || {};
+  // intenta varias variantes por si tu esquema cambia
+  const m =
+    data.matricula ||
+    data.alumnoMatricula ||
+    data.matriculaAlumno ||
+    data.studentId ||
+    null;
+
+  return String(m || doc.id);
+}
+
 // Buscar usuario por email en colaboradores o alumnos
 async function findUserByEmail(email) {
   // 1) Colaboradores: correoInstitucional
@@ -38,7 +52,8 @@ async function findUserByEmail(email) {
     const doc = padreSnap.docs[0];
     return {
       role: "padre",
-      id: doc.id,
+      // ✅ IMPORTANTE: usar matrícula si existe
+      id: alumnoIdFromDoc(doc),
       source: "alumnos",
       data: doc.data(),
       matchField: "correoPadre",
@@ -56,14 +71,14 @@ async function findUserByEmail(email) {
     const doc = famSnap.docs[0];
     return {
       role: "padre",
-      id: doc.id,
+      // ✅ IMPORTANTE: usar matrícula si existe
+      id: alumnoIdFromDoc(doc),
       source: "alumnos",
       data: doc.data(),
       matchField: "correoFamiliar",
     };
   }
 
-  // Si nada coincide:
   return null;
 }
 
@@ -72,9 +87,7 @@ router.post("/google", async (req, res) => {
   try {
     const { idToken } = req.body || {};
     if (!idToken) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "idToken requerido" });
+      return res.status(400).json({ ok: false, error: "idToken requerido" });
     }
 
     // 1) Verificar token de Firebase (idToken del front)
@@ -83,9 +96,7 @@ router.post("/google", async (req, res) => {
       decoded = await adminAuth.verifyIdToken(idToken);
     } catch (e) {
       console.error("[auth/google] verifyIdToken error:", e);
-      return res
-        .status(401)
-        .json({ ok: false, error: "idToken inválido" });
+      return res.status(401).json({ ok: false, error: "idToken inválido" });
     }
 
     const email = decoded.email;
@@ -105,8 +116,7 @@ router.post("/google", async (req, res) => {
       return res.status(403).json({
         ok: false,
         error: "not_authorized",
-        message:
-          "Este correo no está registrado como colaborador o familiar.",
+        message: "Este correo no está registrado como colaborador o familiar.",
       });
     }
 
@@ -115,7 +125,7 @@ router.post("/google", async (req, res) => {
     // 3) Crear tu propio JWT (para proteger tus rutas)
     const token = jwt.sign(
       {
-        sub: id,
+        sub: id, // ✅ para padre ya será matrícula si existe
         email,
         role,
       },
@@ -123,12 +133,11 @@ router.post("/google", async (req, res) => {
       { expiresIn: "8h" }
     );
 
-    // 4) Perfil simplificado (lo que va al localStorage y lee el Navbar)
+    // 4) Perfil simplificado (móvil/web)
     let nombre = null;
     let apellidos = null;
 
     if (role === "colaborador") {
-      // Colaboradores: nombrePreferido o nombres + apellidoPaterno
       nombre = data.nombrePreferido || data.nombres || null;
       apellidos =
         data.apellidoPaterno ||
@@ -136,23 +145,12 @@ router.post("/google", async (req, res) => {
         data.apellidoMaterno ||
         null;
     } else if (role === "padre") {
-      // Padre/Tutor: SIEMPRE campos familiares de Step4Familiar
-      //  - nombrePadre
-      //  - apellidosPadre
       nombre = data.nombrePadre || null;
       apellidos = data.apellidosPadre || null;
     } else {
-      // Fallback futuro
-      nombre =
-        data.nombrePadre ||
-        data.nombrePreferido ||
-        data.nombres ||
-        null;
+      nombre = data.nombrePadre || data.nombrePreferido || data.nombres || null;
       apellidos =
-        data.apellidosPadre ||
-        data.apellidoPaterno ||
-        data.apellidos ||
-        null;
+        data.apellidosPadre || data.apellidoPaterno || data.apellidos || null;
     }
 
     res.json({
@@ -161,12 +159,12 @@ router.post("/google", async (req, res) => {
       role,
       email,
       profile: {
-        id,
+        id, // ✅ matrícula si existe
         role,
         email,
         nombre,
         apellidos,
-        matchField, // para debug
+        matchField,
       },
     });
   } catch (e) {

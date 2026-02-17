@@ -1,9 +1,14 @@
 // src/routes/reportes.js
 import { Router } from "express";
 import admin, { firestore } from "../firebase.js";
+import { requireAuth } from "../middleware/auth.js";
+import { sendPushToAlumno } from "../services/pushService.js";
 
 const router = Router();
+
+// ✅ Colección raíz (NO collectionGroup)
 const col = firestore.collection("reportes");
+const DOC_ID = admin.firestore.FieldPath.documentId();
 
 function asInt(v, def) {
   const n = Number(v);
@@ -16,59 +21,174 @@ function computeEstado(visibleHastaIso) {
   return t < Date.now() ? "vencido" : "activo";
 }
 
+/** ✅ Normaliza matrícula (para evitar "a001 " vs "A001") */
+function normMatricula(v) {
+  return String(v || "").trim().toUpperCase();
+}
+
+/** ✅ Normaliza fechas a ISO UTC (con Z) SIEMPRE. */
+function toISOOrNull(v) {
+  if (typeof v !== "string" && typeof v !== "number") return null;
+
+  const raw = String(v).trim();
+  if (!raw) return null;
+
+  const d = new Date(raw);
+  const t = d.getTime();
+  if (!Number.isFinite(t)) return null;
+
+  return d.toISOString();
+}
+
+/** ✅ Para filtros from/to: Recibe YYYY-MM-DD y crea rango UTC completo. */
+function dayStartUTC(yyyy_mm_dd) {
+  return new Date(`${yyyy_mm_dd}T00:00:00.000Z`).toISOString();
+}
+function dayEndUTC(yyyy_mm_dd) {
+  return new Date(`${yyyy_mm_dd}T23:59:59.999Z`).toISOString();
+}
+
+/** ✅ búsqueda simple (post-filter) */
+function matchQ(item, qRaw) {
+  const q = String(qRaw || "").trim().toLowerCase();
+  if (!q) return true;
+
+  const titulo = String(item.titulo || "").toLowerCase();
+  const detalle = String(item.detalle || "").toLowerCase();
+
+  return titulo.includes(q) || detalle.includes(q);
+}
+
 /**
  * GET /api/reportes
- * Query params:
- * - from, to (YYYY-MM-DD) opcional (filtra por fechaEvento)
- * - alumno (matrícula)
- * - tipo, severidad, estado
- * - pageSize (default 50)
- * - cursor (id del último doc)
+ * Query:
+ *  - alumno: "A0089" => prefijo (startsWith) por default
+ *  - alumnoExact=1 => match exacto (opcional)
+ *  - includeAll=1: web -> no fuerza visibleParaPadre
  */
-router.get("/", async (req, res) => {
+router.get("/", requireAuth, async (req, res) => {
   try {
     const {
       from = "",
       to = "",
       alumno = "",
+      alumnoExact = "", // ✅ opcional (si algún día quieres exact)
       tipo = "",
       severidad = "",
       estado = "",
+      q = "",
       pageSize = "50",
       cursor = "",
-      // q por ahora no lo usamos en Firestore (luego lo hacemos con índices / search)
+      includeAll = "",
     } = req.query;
 
-    let q = col.orderBy("fechaEvento", "desc");
-
-    // filtros exactos (estos sí funcionan directo)
-    if (alumno) q = q.where("alumnoMatricula", "==", String(alumno));
-    if (tipo) q = q.where("tipo", "==", String(tipo));
-    if (severidad) q = q.where("severidad", "==", String(severidad));
-    if (estado) q = q.where("estado", "==", String(estado));
-
-    // filtros por rango de fecha (YYYY-MM-DD)
-    // convertimos a ISO para comparar por string ISO (recomendado guardar fechaEvento ISO)
-    if (from) {
-      const fromIso = new Date(`${from}T00:00:00.000Z`).toISOString();
-      q = q.where("fechaEvento", ">=", fromIso);
-    }
-    if (to) {
-      const toIso = new Date(`${to}T23:59:59.999Z`).toISOString();
-      q = q.where("fechaEvento", "<=", toIso);
-    }
-
-    // cursor por id (paginación)
-    if (cursor) {
-      const snapCursor = await col.doc(String(cursor)).get();
-      if (snapCursor.exists) q = q.startAfter(snapCursor);
-    }
-
     const limit = Math.min(200, Math.max(1, asInt(pageSize, 50)));
-    const snap = await q.limit(limit).get();
+    const includeAllBool = String(includeAll) === "1";
 
-    const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    const nextCursor = snap.docs.length ? snap.docs[snap.docs.length - 1].id : null;
+    const alumnoRaw = String(alumno || "").trim();
+    const hasAlumno = alumnoRaw.length > 0;
+
+    const exactMode = hasAlumno && String(alumnoExact) === "1";
+    const alumnoValue = hasAlumno ? normMatricula(alumnoRaw) : "";
+
+    let query = col;
+
+    // filtros de igualdad (siempre seguros)
+    if (tipo) query = query.where("tipo", "==", String(tipo));
+    if (severidad) query = query.where("severidad", "==", String(severidad));
+    if (estado) query = query.where("estado", "==", String(estado));
+
+    // ✅ móvil: por defecto solo visibles para padre (cuando NO es includeAll=1)
+    if (!includeAllBool) {
+      query = query.where("visibleParaPadre", "==", true);
+    }
+
+    if (hasAlumno) {
+      if (exactMode) {
+        // ✅ (Opcional) Exact match si mandas alumnoExact=1
+        query = query.where("alumnoMatricula", "==", alumnoValue);
+
+        // aquí SÍ podemos usar rangos de fechaEvento en Firestore
+        if (from) query = query.where("fechaEvento", ">=", dayStartUTC(String(from)));
+        if (to) query = query.where("fechaEvento", "<=", dayEndUTC(String(to)));
+
+        query = query.orderBy("fechaEvento", "desc").orderBy(DOC_ID, "desc");
+
+        if (cursor) {
+          // cursor modo exact: fechaEvento|docId
+          const [lastFechaEvento, lastDocId] = String(cursor).split("|");
+          if (lastFechaEvento && lastDocId) query = query.startAfter(lastFechaEvento, lastDocId);
+        }
+      } else {
+        /**
+         * ✅ DEFAULT: PREFIJO (startsWith)
+         * alumnoMatricula entre [prefix, prefix\uf8ff]
+         */
+        const end = alumnoValue + "\uf8ff";
+
+        query = query
+          .where("alumnoMatricula", ">=", alumnoValue)
+          .where("alumnoMatricula", "<=", end)
+          // cuando hay range en alumnoMatricula, el primer orderBy debe ser ese mismo campo
+          .orderBy("alumnoMatricula", "asc")
+          .orderBy("fechaEvento", "desc")
+          .orderBy(DOC_ID, "desc");
+
+        // ⚠️ Con range en alumnoMatricula NO metemos range de fechaEvento en Firestore.
+        // from/to se aplica luego en memoria (post-filter).
+        if (cursor) {
+          // cursor modo prefijo: alumnoMatricula|fechaEvento|docId
+          const [cM, cF, cId] = String(cursor).split("|");
+          if (cM && cF && cId) query = query.startAfter(cM, cF, cId);
+        }
+      }
+    } else {
+      // ✅ sin alumno: filtros por fechaEvento normales
+      if (from) query = query.where("fechaEvento", ">=", dayStartUTC(String(from)));
+      if (to) query = query.where("fechaEvento", "<=", dayEndUTC(String(to)));
+
+      query = query.orderBy("fechaEvento", "desc").orderBy(DOC_ID, "desc");
+
+      if (cursor) {
+        const [lastFechaEvento, lastDocId] = String(cursor).split("|");
+        if (lastFechaEvento && lastDocId) query = query.startAfter(lastFechaEvento, lastDocId);
+      }
+    }
+
+    const snap = await query.limit(limit).get();
+    const rawItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    // ✅ post-filters
+    let items = rawItems;
+
+    // si estamos en prefijo, aplicamos from/to aquí
+    if (hasAlumno && !exactMode && (from || to)) {
+      const a = from ? dayStartUTC(String(from)) : null;
+      const b = to ? dayEndUTC(String(to)) : null;
+
+      items = items.filter((it) => {
+        const fe = String(it.fechaEvento || "");
+        if (!fe) return false;
+        if (a && fe < a) return false;
+        if (b && fe > b) return false;
+        return true;
+      });
+    }
+
+    if (q) items = items.filter((it) => matchQ(it, q));
+
+    // ✅ nextCursor (depende del modo)
+    let nextCursor = null;
+    if (snap.docs.length) {
+      const last = snap.docs[snap.docs.length - 1];
+      const data = last.data() || {};
+
+      if (hasAlumno && !exactMode) {
+        nextCursor = `${String(data.alumnoMatricula || "")}|${String(data.fechaEvento || "")}|${last.id}`;
+      } else {
+        nextCursor = `${String(data.fechaEvento || "")}|${last.id}`;
+      }
+    }
 
     res.json({ ok: true, items, nextCursor });
   } catch (e) {
@@ -79,36 +199,38 @@ router.get("/", async (req, res) => {
 
 /**
  * POST /api/reportes
+ * ✅ manda push si notificarPadre=true y visibleParaPadre=true
  */
-router.post("/", async (req, res) => {
+router.post("/", requireAuth, async (req, res) => {
   try {
     const b = req.body || {};
 
-    // validación mínima (lo puedes endurecer)
-    if (!b.alumnoMatricula) {
-      return res.status(400).json({ ok: false, error: "alumnoMatricula requerido" });
-    }
-    if (!b.titulo) {
-      return res.status(400).json({ ok: false, error: "titulo requerido" });
-    }
-    if (!b.fechaEvento) {
-      return res.status(400).json({ ok: false, error: "fechaEvento requerido (ISO)" });
-    }
-    if (!b.visibleHasta) {
-      return res.status(400).json({ ok: false, error: "visibleHasta requerido (ISO)" });
-    }
+    if (!b.alumnoMatricula) return res.status(400).json({ ok: false, error: "alumnoMatricula requerido" });
+    if (!b.titulo) return res.status(400).json({ ok: false, error: "titulo requerido" });
+    if (!b.fechaEvento) return res.status(400).json({ ok: false, error: "fechaEvento requerido (ISO)" });
+    if (!b.visibleHasta) return res.status(400).json({ ok: false, error: "visibleHasta requerido (ISO)" });
+
+    const fechaEventoISO = toISOOrNull(b.fechaEvento);
+    const visibleHastaISO = toISOOrNull(b.visibleHasta);
+
+    if (!fechaEventoISO) return res.status(400).json({ ok: false, error: "fechaEvento inválido (ISO)" });
+    if (!visibleHastaISO) return res.status(400).json({ ok: false, error: "visibleHasta inválido (ISO)" });
 
     const docRef = col.doc();
     const now = admin.firestore.FieldValue.serverTimestamp();
 
+    const matriculaNorm = normMatricula(b.alumnoMatricula);
+
     const payload = {
-      alumnoMatricula: String(b.alumnoMatricula),
+      alumnoMatricula: matriculaNorm,
+      alumnoMatriculaNorm: matriculaNorm, // opcional (por si luego migras a búsquedas/index)
+
       alumnoNombre: b.alumnoNombre ? String(b.alumnoNombre) : "",
       grado: b.grado ? String(b.grado) : "",
       grupo: b.grupo ? String(b.grupo) : "",
 
-      fechaEvento: String(b.fechaEvento),
-      visibleHasta: String(b.visibleHasta),
+      fechaEvento: fechaEventoISO,
+      visibleHasta: visibleHastaISO,
 
       tipo: String(b.tipo || "otro"),
       severidad: String(b.severidad || "normal"),
@@ -123,7 +245,7 @@ router.post("/", async (req, res) => {
       visibleParaPadre: Boolean(b.visibleParaPadre),
       notificarPadre: Boolean(b.notificarPadre),
 
-      estado: computeEstado(String(b.visibleHasta)),
+      estado: computeEstado(visibleHastaISO),
 
       createdAt: now,
       updatedAt: now,
@@ -131,8 +253,29 @@ router.post("/", async (req, res) => {
 
     await docRef.set(payload);
 
+    let pushResult = null;
+    if (payload.visibleParaPadre && payload.notificarPadre) {
+      try {
+        const title = payload.alumnoNombre ? `Nuevo reporte: ${payload.alumnoNombre}` : "Nuevo reporte";
+        const body = payload.titulo || "Tienes un nuevo reporte.";
+
+        pushResult = await sendPushToAlumno(payload.alumnoMatricula, {
+          title,
+          body,
+          data: {
+            kind: "reporte",
+            reporteId: docRef.id,
+            alumnoMatricula: payload.alumnoMatricula,
+          },
+        });
+      } catch (e) {
+        console.error("[reportes] push error:", e);
+        pushResult = { ok: false, error: String(e) };
+      }
+    }
+
     const saved = await docRef.get();
-    res.status(201).json({ ok: true, item: { id: saved.id, ...saved.data() } });
+    res.status(201).json({ ok: true, item: { id: saved.id, ...saved.data() }, push: pushResult });
   } catch (e) {
     console.error("[POST /api/reportes] error:", e);
     res.status(500).json({ ok: false, error: String(e) });
@@ -142,7 +285,7 @@ router.post("/", async (req, res) => {
 /**
  * PATCH /api/reportes/:id
  */
-router.patch("/:id", async (req, res) => {
+router.patch("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body || {};
@@ -156,9 +299,23 @@ router.patch("/:id", async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // si cambió visibleHasta, recompute estado
-    if (typeof b.visibleHasta === "string") {
-      patch.estado = computeEstado(b.visibleHasta);
+    if (b.alumnoMatricula != null) {
+      const m = normMatricula(b.alumnoMatricula);
+      patch.alumnoMatricula = m;
+      patch.alumnoMatriculaNorm = m;
+    }
+
+    if (b.fechaEvento != null) {
+      const iso = toISOOrNull(b.fechaEvento);
+      if (!iso) return res.status(400).json({ ok: false, error: "fechaEvento inválido (ISO)" });
+      patch.fechaEvento = iso;
+    }
+
+    if (b.visibleHasta != null) {
+      const iso = toISOOrNull(b.visibleHasta);
+      if (!iso) return res.status(400).json({ ok: false, error: "visibleHasta inválido (ISO)" });
+      patch.visibleHasta = iso;
+      patch.estado = computeEstado(iso);
     }
 
     await ref.update(patch);
@@ -171,10 +328,7 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/reportes/:id
- */
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     await col.doc(id).delete();
