@@ -12,7 +12,8 @@ import authRouter from "./routes/auth.js";
 import reportesRouter from "./routes/reportes.js";
 import pushRouter from "./routes/push.js";
 import qrRouter from "./routes/qr.js";
-import oficiosRouter from "./routes/oficios.js"; // ✅ NUEVO
+import oficiosRouter from "./routes/oficios.js";
+import calendarioRouter from "./routes/calendario.js";
 
 import { firestore } from "./firebase.js";
 
@@ -69,9 +70,11 @@ app.use("/api/push", pushRouter);
 console.log("[BOOT] mounting /api/qr");
 app.use("/api/qr", qrRouter);
 
-// ✅ NUEVO: Oficios
 console.log("[BOOT] mounting /api/oficios");
 app.use("/api/oficios", oficiosRouter);
+
+console.log("[BOOT] mounting /api/calendario");
+app.use("/api/calendario", calendarioRouter);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "Not Found", path: req.path });

@@ -7,7 +7,7 @@ import { sendPushToAlumno } from "../services/pushService.js";
 const router = Router();
 
 const COL = firestore.collection("qrScans");
-const ALUMNOS_COL = firestore.collection("alumnos"); // ajusta si se llama distinto
+const ALUMNOS_COL = firestore.collection("alumnos");
 
 /* =========================
    Helpers
@@ -36,30 +36,40 @@ function parseMatFromQr(raw) {
   return normMatricula(s);
 }
 
-// 🔎 Busca alumno para snapshot (nombre/grado/grupo/nivel)
+/* =========================
+   🔎 BUSCAR ALUMNO CORREGIDO
+   Ahora usa el ID del documento
+   ========================= */
 async function getAlumnoSnapshotByMatricula(matricula) {
   const m = normMatricula(matricula);
   if (!m) return null;
 
-  const snap = await ALUMNOS_COL.where("matricula", "==", m).limit(1).get();
-  if (snap.empty) return null;
+  try {
+    // 🔥 El ID del documento ES la matrícula (según tu Firestore)
+    const doc = await ALUMNOS_COL.doc(m).get();
 
-  const data = snap.docs[0].data() || {};
-  const nombres = data.nombres || data.nombre || "";
-  const apellidos = data.apellidos || "";
-  const alumnoNombre = `${nombres} ${apellidos}`.trim();
+    if (!doc.exists) return null;
 
-  return {
-    alumnoNombre: alumnoNombre || null,
-    alumnoGrado: data.grado || null,
-    alumnoGrupo: data.grupo || null,
-    alumnoNivel: data.nivel || null,
-  };
+    const data = doc.data() || {};
+
+    const nombres = data.nombres || data.nombre || "";
+    const apellidos = data.apellidos || "";
+    const alumnoNombre = `${nombres} ${apellidos}`.trim();
+
+    return {
+      alumnoNombre: alumnoNombre || null,
+      alumnoGrado: data.grado || null,
+      alumnoGrupo: data.grupo || null,
+      alumnoNivel: data.nivel || null,
+    };
+  } catch (err) {
+    console.error("[getAlumnoSnapshotByMatricula] error:", err);
+    return null;
+  }
 }
 
 /* =========================
    POST /api/qr/scan
-   ✅ Solo colaboradores
    ========================= */
 router.post("/scan", requireAuth, async (req, res) => {
   try {
@@ -82,14 +92,8 @@ router.post("/scan", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "qr_invalido" });
     }
 
-    // snapshot alumno
-    let alumnoSnap = null;
-    try {
-      alumnoSnap = await getAlumnoSnapshotByMatricula(alumnoMatricula);
-    } catch (e) {
-      console.error("[qr/scan] alumno lookup error:", e);
-      alumnoSnap = null;
-    }
+    // 🔎 snapshot alumno
+    const alumnoSnap = await getAlumnoSnapshotByMatricula(alumnoMatricula);
 
     const colaboradorId = String(req.user?.sub || "");
     const colaboradorNombre = getColaboradorNombre(req);
@@ -116,8 +120,11 @@ router.post("/scan", requireAuth, async (req, res) => {
 
     const ref = await COL.add(payload);
 
-    // Push (mejor mensaje)
+    /* =========================
+       PUSH NOTIFICATION
+       ========================= */
     let pushResult = null;
+
     try {
       const tipoLower = String(tipo || "").toLowerCase();
       const title = tipoLower.includes("salida")
@@ -148,6 +155,7 @@ router.post("/scan", requireAuth, async (req, res) => {
     }
 
     const snap = await ref.get();
+
     return res.status(201).json({
       ok: true,
       item: { id: snap.id, ...snap.data() },
@@ -161,13 +169,6 @@ router.post("/scan", requireAuth, async (req, res) => {
 
 /* =========================
    GET /api/qr/history
-   ✅ colaborador:
-      - si manda alumno => filtra por alumno
-      - si NO manda alumno => modo general (todos)
-   ✅ padre:
-      - SIEMPRE forzado a su propio hijo (req.user.sub)
-   Query:
-   alumno?, from?, to?, tipo?, q?, grado?, grupo?, nivel?, pageSize?, cursor?
    ========================= */
 router.get("/history", requireAuth, async (req, res) => {
   try {
@@ -192,63 +193,44 @@ router.get("/history", requireAuth, async (req, res) => {
 
     const limit = Math.min(200, Math.max(1, Number(pageSize) || 50));
 
-    // ✅ PADRE: alumno siempre = sub
-    // ✅ COLABORADOR: alumno viene del query (puede estar vacío)
     const alumnoForced =
       role === "padre" ? String(req.user?.sub || "") : String(alumno || "");
 
     const alumnoNorm = alumnoForced ? normMatricula(alumnoForced) : "";
 
-    // ── Armado base de query ──
-    let query;
-
-    if (role === "padre") {
-      // Padre debe tener matrícula sí o sí (viene del token)
-      if (!alumnoNorm) {
-        return res.status(400).json({ ok: false, error: "alumno requerido" });
-      }
-
-      query = COL.where("alumnoMatricula", "==", alumnoNorm).orderBy(
-        "createdAtIso",
-        "desc"
-      );
-    } else {
-      // Colaborador: si hay alumno filtra, si no hay alumno lista todo
-      query = alumnoNorm
+    let query =
+      role === "padre"
+        ? COL.where("alumnoMatricula", "==", alumnoNorm).orderBy(
+            "createdAtIso",
+            "desc"
+          )
+        : alumnoNorm
         ? COL.where("alumnoMatricula", "==", alumnoNorm).orderBy(
             "createdAtIso",
             "desc"
           )
         : COL.orderBy("createdAtIso", "desc");
-    }
 
-    // filtros Firestore (pueden pedir índice si combinas varios)
     if (tipo) query = query.where("tipo", "==", String(tipo));
 
     if (from) {
       const isoFrom = new Date(`${from}T00:00:00.000Z`).toISOString();
       query = query.where("createdAtIso", ">=", isoFrom);
     }
+
     if (to) {
       const isoTo = new Date(`${to}T23:59:59.999Z`).toISOString();
       query = query.where("createdAtIso", "<=", isoTo);
     }
 
-    // Cursor: "iso|docId" o solo docId
-    let cursorId = "";
     if (cursor) {
-      const parts = String(cursor).split("|");
-      cursorId = parts.length === 2 ? parts[1] : String(cursor);
-    }
-    if (cursorId) {
-      const cursorSnap = await COL.doc(cursorId).get();
+      const cursorSnap = await COL.doc(String(cursor)).get();
       if (cursorSnap.exists) query = query.startAfter(cursorSnap);
     }
 
     const snap = await query.limit(limit).get();
     let items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    // filtros extra en memoria (NO requieren índices)
     const qs = String(q || "").trim().toLowerCase();
     const g = String(grado || "").trim().toLowerCase();
     const gr = String(grupo || "").trim().toLowerCase();
@@ -275,14 +257,7 @@ router.get("/history", requireAuth, async (req, res) => {
       });
     }
 
-    let nextCursor = null;
-    if (snap.docs.length) {
-      const last = snap.docs[snap.docs.length - 1];
-      const d = last.data() || {};
-      nextCursor = `${String(d.createdAtIso || "")}|${last.id}`;
-    }
-
-    return res.json({ ok: true, items, nextCursor });
+    return res.json({ ok: true, items });
   } catch (e) {
     console.error("[GET /api/qr/history] error:", e);
     return res.status(500).json({ ok: false, error: String(e) });
@@ -291,8 +266,6 @@ router.get("/history", requireAuth, async (req, res) => {
 
 /* =========================
    GET /api/qr/history/:id
-   ✅ colaborador: ok
-   ✅ padre: solo si el scan pertenece a su matrícula (sub)
    ========================= */
 router.get("/history/:id", requireAuth, async (req, res) => {
   try {
@@ -312,7 +285,6 @@ router.get("/history/:id", requireAuth, async (req, res) => {
 
     const item = { id: doc.id, ...doc.data() };
 
-    // ✅ padre: validar matrícula (sub) vs item.alumnoMatricula
     if (role === "padre") {
       const myMat = normMatricula(req.user?.sub || "");
       const itMat = normMatricula(item.alumnoMatricula || "");
