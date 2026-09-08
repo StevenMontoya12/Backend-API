@@ -5,171 +5,438 @@ import { firestore, auth as adminAuth } from "../firebase.js";
 
 const router = Router();
 
-const JWT_SECRET = process.env.AUTH_JWT_SECRET || "cambia-esto-en-produccion";
+const JWT_SECRET = process.env.AUTH_JWT_SECRET;
 
-// helper: sacar "id lógico" del alumno (preferimos matrícula)
+if (!JWT_SECRET) {
+  throw new Error(
+    "AUTH_JWT_SECRET no está configurado en las variables de entorno"
+  );
+}
+
+/* =========================================================
+ * Helpers
+ * ======================================================= */
+
+function cleanStr(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeEmail(value) {
+  return cleanStr(value).toLowerCase();
+}
+
 function alumnoIdFromDoc(doc) {
   const data = doc.data() || {};
-  // intenta varias variantes por si tu esquema cambia
-  const m =
+
+  const matricula =
     data.matricula ||
     data.alumnoMatricula ||
     data.matriculaAlumno ||
     data.studentId ||
-    null;
+    doc.id;
 
-  return String(m || doc.id);
+  return cleanStr(matricula);
 }
 
-// Buscar usuario por email en colaboradores o alumnos
-async function findUserByEmail(email) {
-  // 1) Colaboradores: correoInstitucional
-  const colSnap = await firestore
-    .collection("colaboradores")
-    .where("correoInstitucional", "==", email)
-    .limit(1)
-    .get();
+/**
+ * Busca por el correo tal como lo entrega Google y también
+ * por su versión en minúsculas.
+ *
+ * Firestore compara strings de forma exacta, por eso es
+ * recomendable guardar siempre los correos en minúsculas.
+ */
+async function getDocsByEmail({
+  collectionName,
+  field,
+  email,
+}) {
+  const values = Array.from(
+    new Set([
+      cleanStr(email),
+      normalizeEmail(email),
+    ])
+  ).filter(Boolean);
 
-  if (!colSnap.empty) {
-    const doc = colSnap.docs[0];
-    return {
-      role: "colaborador",
-      id: doc.id,
-      source: "colaboradores",
-      data: doc.data(),
-      matchField: "correoInstitucional",
-    };
+  const snapshots = await Promise.all(
+    values.map((value) =>
+      firestore
+        .collection(collectionName)
+        .where(field, "==", value)
+        .get()
+    )
+  );
+
+  const documentsById = new Map();
+
+  for (const snapshot of snapshots) {
+    for (const doc of snapshot.docs) {
+      documentsById.set(doc.id, doc);
+    }
   }
 
-  // 2) Alumnos: correoPadre (correo del padre/tutor)
-  const padreSnap = await firestore
-    .collection("alumnos")
-    .where("correoPadre", "==", email)
-    .limit(1)
-    .get();
-
-  if (!padreSnap.empty) {
-    const doc = padreSnap.docs[0];
-    return {
-      role: "padre",
-      // ✅ IMPORTANTE: usar matrícula si existe
-      id: alumnoIdFromDoc(doc),
-      source: "alumnos",
-      data: doc.data(),
-      matchField: "correoPadre",
-    };
-  }
-
-  // 3) Alumnos: correoFamiliar (correo “general” familiar)
-  const famSnap = await firestore
-    .collection("alumnos")
-    .where("correoFamiliar", "==", email)
-    .limit(1)
-    .get();
-
-  if (!famSnap.empty) {
-    const doc = famSnap.docs[0];
-    return {
-      role: "padre",
-      // ✅ IMPORTANTE: usar matrícula si existe
-      id: alumnoIdFromDoc(doc),
-      source: "alumnos",
-      data: doc.data(),
-      matchField: "correoFamiliar",
-    };
-  }
-
-  return null;
+  return Array.from(documentsById.values());
 }
 
-// POST /api/auth/google
+function mapAlumnoForSession(doc) {
+  const data = doc.data() || {};
+  const matricula = alumnoIdFromDoc(doc);
+
+  return {
+    id: matricula,
+    matricula,
+    nombres: cleanStr(data.nombres),
+    apellidos: cleanStr(data.apellidos),
+    nivel: cleanStr(data.nivel),
+    grado: cleanStr(data.grado),
+    grupo: cleanStr(data.grupo),
+    grupoPrincipal: cleanStr(data.grupoPrincipal),
+    estatus: cleanStr(data.estatus || "activo"),
+  };
+}
+
+/**
+ * Busca todos los alumnos relacionados con el correo.
+ *
+ * Un alumno podría aparecer en correoPadre y correoFamiliar,
+ * por eso se eliminan duplicados usando la matrícula.
+ */
+async function findAlumnosByEmail(email) {
+  const [
+    padreDocs,
+    familiarDocs,
+  ] = await Promise.all([
+    getDocsByEmail({
+      collectionName: "alumnos",
+      field: "correoPadre",
+      email,
+    }),
+
+    getDocsByEmail({
+      collectionName: "alumnos",
+      field: "correoFamiliar",
+      email,
+    }),
+  ]);
+
+  const documentsByMatricula = new Map();
+
+  for (const doc of [...padreDocs, ...familiarDocs]) {
+    const matricula = alumnoIdFromDoc(doc);
+
+    if (!matricula) {
+      continue;
+    }
+
+    documentsByMatricula.set(matricula, doc);
+  }
+
+  const documents = Array.from(documentsByMatricula.values());
+
+  documents.sort((a, b) => {
+    const alumnoA = a.data() || {};
+    const alumnoB = b.data() || {};
+
+    const nameA = `${alumnoA.nombres || ""} ${alumnoA.apellidos || ""}`
+      .trim()
+      .toLocaleLowerCase("es");
+
+    const nameB = `${alumnoB.nombres || ""} ${alumnoB.apellidos || ""}`
+      .trim()
+      .toLocaleLowerCase("es");
+
+    return nameA.localeCompare(nameB, "es");
+  });
+
+  return {
+    documents,
+    hijos: documents.map(mapAlumnoForSession),
+  };
+}
+
+/**
+ * Conservamos la búsqueda de colaboradores para no eliminar
+ * el funcionamiento que ya tenías.
+ *
+ * Por ahora, cuando alguien tenga hijos, el rol principal
+ * será "padre". Más adelante mostraremos la selección entre
+ * modo colaborador y modo familiar.
+ */
+async function findColaboradorByEmail(email) {
+  const documents = await getDocsByEmail({
+    collectionName: "colaboradores",
+    field: "correoInstitucional",
+    email,
+  });
+
+  if (documents.length === 0) {
+    return null;
+  }
+
+  const doc = documents[0];
+
+  return {
+    id: doc.id,
+    data: doc.data() || {},
+  };
+}
+
+function splitGoogleName(fullName) {
+  const parts = cleanStr(fullName)
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (parts.length === 0) {
+    return {
+      nombre: null,
+      apellidos: null,
+    };
+  }
+
+  return {
+    nombre: parts[0] || null,
+    apellidos:
+      parts.length > 1
+        ? parts.slice(1).join(" ")
+        : null,
+  };
+}
+
+/* =========================================================
+ * POST /api/auth/google
+ * ======================================================= */
+
 router.post("/google", async (req, res) => {
   try {
     const { idToken } = req.body || {};
+
     if (!idToken) {
-      return res.status(400).json({ ok: false, error: "idToken requerido" });
+      return res.status(400).json({
+        ok: false,
+        error: "idToken_requerido",
+        message: "El idToken es obligatorio.",
+      });
     }
 
-    // 1) Verificar token de Firebase (idToken del front)
+    /* -----------------------------------------------------
+     * 1. Verificar token de Firebase
+     * --------------------------------------------------- */
+
     let decoded;
+
     try {
       decoded = await adminAuth.verifyIdToken(idToken);
-    } catch (e) {
-      console.error("[auth/google] verifyIdToken error:", e);
-      return res.status(401).json({ ok: false, error: "idToken inválido" });
+    } catch (error) {
+      console.error(
+        "[auth/google] Error verificando idToken:",
+        error
+      );
+
+      return res.status(401).json({
+        ok: false,
+        error: "idToken_invalido",
+        message: "La sesión de Google no es válida.",
+      });
     }
 
-    const email = decoded.email;
-    const emailVerified = decoded.email_verified;
+    const email = normalizeEmail(decoded.email);
+    const emailVerified = Boolean(decoded.email_verified);
+    const firebaseUid = cleanStr(decoded.uid);
 
     if (!email || !emailVerified) {
       return res.status(403).json({
         ok: false,
         error: "email_no_verificado",
-        message: "Se requiere un correo verificado de Google.",
+        message:
+          "Se requiere una cuenta de Google con correo verificado.",
       });
     }
 
-    // 2) Buscar en Firestore
-    const found = await findUserByEmail(email);
-    if (!found) {
+    if (!firebaseUid) {
+      return res.status(401).json({
+        ok: false,
+        error: "firebase_uid_no_disponible",
+        message:
+          "No se pudo identificar la cuenta de Firebase.",
+      });
+    }
+
+    /* -----------------------------------------------------
+     * 2. Buscar hijos y colaborador
+     * --------------------------------------------------- */
+
+    const [
+      alumnosResult,
+      colaborador,
+    ] = await Promise.all([
+      findAlumnosByEmail(email),
+      findColaboradorByEmail(email),
+    ]);
+
+    const hijos = alumnosResult.hijos;
+    const alumnoDocuments = alumnosResult.documents;
+
+    const esPadre = hijos.length > 0;
+    const esColaborador = Boolean(colaborador);
+
+    if (!esPadre && !esColaborador) {
       return res.status(403).json({
         ok: false,
         error: "not_authorized",
-        message: "Este correo no está registrado como colaborador o familiar.",
+        message:
+          "Este correo no está registrado como familiar o colaborador.",
       });
     }
 
-    const { role, id, data, matchField } = found;
+    /*
+     * En esta primera etapa damos prioridad al flujo familiar.
+     * Si tiene hijos y también es colaborador:
+     *
+     * role  = "padre"
+     * roles = ["padre", "colaborador"]
+     */
+    const roles = [];
 
-    // 3) Crear tu propio JWT (para proteger tus rutas)
-    const token = jwt.sign(
-      {
-        sub: id, // ✅ para padre ya será matrícula si existe
-        email,
-        role,
-      },
-      JWT_SECRET,
-      { expiresIn: "8h" }
+    if (esPadre) {
+      roles.push("padre");
+    }
+
+    if (esColaborador) {
+      roles.push("colaborador");
+    }
+
+    const role = esPadre
+      ? "padre"
+      : "colaborador";
+
+    const alumnoMatriculas = hijos.map(
+      (hijo) => hijo.matricula
     );
 
-    // 4) Perfil simplificado (móvil/web)
+    const alumnoMatriculaDefault =
+      alumnoMatriculas[0] || null;
+
+    /* -----------------------------------------------------
+     * 3. Crear JWT
+     * --------------------------------------------------- */
+
+    const token = jwt.sign(
+      {
+        /*
+         * sub ahora identifica a la persona/cuenta,
+         * no a uno de sus hijos.
+         */
+        sub: firebaseUid,
+
+        uid: firebaseUid,
+        email,
+        role,
+        roles,
+
+        colaboradorId:
+          colaborador?.id || null,
+
+        alumnoMatriculas,
+        alumnoMatriculaDefault,
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "8h",
+        issuer: "coventryschool-api",
+        audience: "coventryschool-app",
+      }
+    );
+
+    /* -----------------------------------------------------
+     * 4. Construir perfil familiar
+     * --------------------------------------------------- */
+
+    const firstAlumnoData =
+      alumnoDocuments[0]?.data() || {};
+
+    const googleName = splitGoogleName(
+      decoded.name || ""
+    );
+
     let nombre = null;
     let apellidos = null;
 
-    if (role === "colaborador") {
-      nombre = data.nombrePreferido || data.nombres || null;
+    if (esPadre) {
+      nombre =
+        cleanStr(firstAlumnoData.nombrePadre) ||
+        googleName.nombre;
+
       apellidos =
-        data.apellidoPaterno ||
-        data.apellidos ||
-        data.apellidoMaterno ||
-        null;
-    } else if (role === "padre") {
-      nombre = data.nombrePadre || null;
-      apellidos = data.apellidosPadre || null;
-    } else {
-      nombre = data.nombrePadre || data.nombrePreferido || data.nombres || null;
+        cleanStr(firstAlumnoData.apellidosPadre) ||
+        googleName.apellidos;
+    } else if (esColaborador) {
+      const colaboradorData =
+        colaborador?.data || {};
+
+      nombre =
+        cleanStr(
+          colaboradorData.nombrePreferido ||
+            colaboradorData.nombres
+        ) ||
+        googleName.nombre;
+
       apellidos =
-        data.apellidosPadre || data.apellidoPaterno || data.apellidos || null;
+        cleanStr(
+          [
+            colaboradorData.apellidoPaterno,
+            colaboradorData.apellidoMaterno,
+          ]
+            .filter(Boolean)
+            .join(" ")
+        ) ||
+        googleName.apellidos;
     }
 
-    res.json({
+    /*
+     * profile.id conserva temporalmente la primera matrícula
+     * para no romper tus pantallas actuales mientras hacemos
+     * la migración completa.
+     *
+     * El identificador real de la cuenta es profile.uid.
+     */
+    const profileId =
+      alumnoMatriculaDefault ||
+      colaborador?.id ||
+      firebaseUid;
+
+    return res.json({
       ok: true,
       token,
       role,
+      roles,
       email,
+
       profile: {
-        id, // ✅ matrícula si existe
+        id: profileId,
+        uid: firebaseUid,
         role,
+        roles,
         email,
         nombre,
         apellidos,
-        matchField,
+        colaboradorId:
+          colaborador?.id || null,
       },
+
+      hijos,
+      alumnoMatriculaDefault,
     });
-  } catch (e) {
-    console.error("[POST /api/auth/google] error:", e);
-    res.status(500).json({ ok: false, error: "internal_error" });
+  } catch (error) {
+    console.error(
+      "[POST /api/auth/google] Error:",
+      error
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      message:
+        "No se pudo completar el inicio de sesión.",
+    });
   }
 });
 

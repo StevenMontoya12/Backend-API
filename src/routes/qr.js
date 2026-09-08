@@ -280,7 +280,7 @@ router.get("/history/:id", requireAuth, async (req, res) => {
 
     const doc = await COL.doc(id).get();
     if (!doc.exists) {
-      return res.status(404).json({ ok: false, error: "not_found" });
+      return res.status(404).json({ ok: false, error: "not_found" });         
     }
 
     const item = { id: doc.id, ...doc.data() };

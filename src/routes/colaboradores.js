@@ -4,317 +4,1000 @@ import { firestore } from "../firebase.js";
 
 const router = Router();
 const COL = "colaboradores";
+const MAX_LIST = 500;
 
-/* =========================
-   Helpers (sanitización)
-   ========================= */
-const isPlainObj = (v) => v && typeof v === "object" && !Array.isArray(v);
-const clampStr = (s, n = 300) => (typeof s === "string" ? s.slice(0, n) : s);
+/* =========================================================
+ * Helpers
+ * ======================================================= */
 
-/** Elimina cualquier undefined en objetos/anidaciones */
+const hasOwn = (obj, key) =>
+  Object.prototype.hasOwnProperty.call(obj ?? {}, key);
+
+const isPlainObj = (value) =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+
+const clampStr = (value, max = 300) =>
+  typeof value === "string" ? value.slice(0, max) : value;
+
+const safeNumber = (value, fallback = 0) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 function stripUndefinedDeep(value) {
   if (Array.isArray(value)) {
     return value.map(stripUndefinedDeep);
   }
+
   if (value && typeof value === "object") {
     const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      if (v !== undefined) out[k] = stripUndefinedDeep(v);
+
+    for (const [key, item] of Object.entries(value)) {
+      if (item !== undefined) {
+        out[key] = stripUndefinedDeep(item);
+      }
     }
+
     return out;
   }
+
   return value;
 }
 
-/* =========================
-   Normalización de payload
-   ========================= */
-const pickColaborador = (body) => {
+const norm = (value = "") =>
+  String(value ?? "")
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .trim();
+
+function pickColaborador(body = {}) {
   const out = {};
 
-  // ===== Laboral
-  out.nombres             = clampStr(body.nombres);
-  out.apellidoPaterno     = clampStr(body.apellidoPaterno);
-  out.apellidoMaterno     = clampStr(body.apellidoMaterno);
-  out.nombrePreferido     = clampStr(body.nombrePreferido);
-  out.correoInstitucional = clampStr(body.correoInstitucional);
-  out.noEmpleado          = clampStr(body.noEmpleado);
-  out.posicion            = clampStr(body.posicion);
-  out.categoriaPuesto     = clampStr(body.categoriaPuesto);
-  out.esquemaTrabajo      = clampStr(body.esquemaTrabajo);
-  out.horasTrabajo        = Number(body.horasTrabajo ?? 0);
-  out.extension           = clampStr(body.extension);
-  out.jefeInmediato       = clampStr(body.jefeInmediato);
-  out.director            = clampStr(body.director);
-  out.direccion           = clampStr(body.direccion);
-  out.fechaIngreso        = clampStr(body.fechaIngreso);
-  out.fechaBaja           = clampStr(body.fechaBaja);
-  out.estatus             = clampStr(body.estatus ?? "Activo");
+  // ===== Laboral / identidad
+  out.nombres = clampStr(body.nombres);
+  out.apellidoPaterno = clampStr(body.apellidoPaterno);
+  out.apellidoMaterno = clampStr(body.apellidoMaterno);
+  out.nombrePreferido = clampStr(body.nombrePreferido);
+
+  out.correoInstitucional = clampStr(
+    body.correoInstitucional
+  );
+
+  out.email = clampStr(
+    body.email ?? body.correoInstitucional
+  );
+
+  out.noEmpleado = clampStr(body.noEmpleado);
+  out.posicion = clampStr(body.posicion);
+  out.categoriaPuesto = clampStr(body.categoriaPuesto);
+  out.esquemaTrabajo = clampStr(body.esquemaTrabajo);
+
+  out.horasTrabajo = safeNumber(
+    body.horasTrabajo,
+    0
+  );
+
+  out.extension = clampStr(body.extension);
+  out.jefeInmediato = clampStr(body.jefeInmediato);
+  out.director = clampStr(body.director);
+  out.direccion = clampStr(body.direccion);
+  out.fechaIngreso = clampStr(body.fechaIngreso);
+  out.fechaBaja = clampStr(body.fechaBaja);
+  out.estatus = clampStr(body.estatus ?? "Activo");
 
   // ===== Personales
   out.fechaNacimiento = clampStr(body.fechaNacimiento);
-  out.nss             = clampStr(body.nss);
-  out.curp            = clampStr(body.curp);
-  out.rfc             = clampStr(body.rfc);
-  out.genero          = clampStr(body.genero);
-  out.estadoCivil     = clampStr(body.estadoCivil);
-  out.gradoEstudios   = clampStr(body.gradoEstudios);
-  out.tallaCamisa     = clampStr(body.tallaCamisa);
-  out.pasatiempos     = clampStr(body.pasatiempos, 2000);
-  out.pastelFavorito  = clampStr(body.pastelFavorito);
+  out.nss = clampStr(body.nss);
+  out.curp = clampStr(body.curp);
+  out.rfc = clampStr(body.rfc);
+  out.genero = clampStr(body.genero);
+  out.estadoCivil = clampStr(body.estadoCivil);
+  out.gradoEstudios = clampStr(body.gradoEstudios);
+  out.tallaCamisa = clampStr(body.tallaCamisa);
+
+  out.pasatiempos = clampStr(
+    body.pasatiempos,
+    2000
+  );
+
+  out.pastelFavorito = clampStr(
+    body.pastelFavorito
+  );
+
+  out.postalFavorito = clampStr(
+    body.postalFavorito
+  );
 
   // ===== Médicos
-  out.tipoSangre           = clampStr(body.tipoSangre);
-  out.alergias             = clampStr(body.alergias, 2000);
-  out.tratamientoMedico    = clampStr(body.tratamientoMedico, 2000);
-  out.enfermedadesCronicas = isPlainObj(body.enfermedadesCronicas)
-    ? {
-        asma: !!body.enfermedadesCronicas.asma,
-        diabetes: !!body.enfermedadesCronicas.diabetes,
-        otra: clampStr(body.enfermedadesCronicas.otra),
-      }
-    : { asma: false, diabetes: false, otra: "" };
+  out.tipoSangre = clampStr(body.tipoSangre);
 
-  // Historial médico
-  out.historialMedico = Array.isArray(body.historialMedico)
-    ? body.historialMedico.map((e) => ({
-        fechaIso: clampStr(e.fechaIso),
-        tipo: clampStr(e.tipo),
-        descripcion: clampStr(e.descripcion, 1000),
-        registradoPor: clampStr(e.registradoPor),
-        observaciones: clampStr(e.observaciones, 1000),
-      }))
-    : [];
+  out.alergias = clampStr(
+    body.alergias,
+    2000
+  );
+
+  out.tratamientoMedico = clampStr(
+    body.tratamientoMedico,
+    2000
+  );
+
+  out.enfermedadesCronicas =
+    isPlainObj(body.enfermedadesCronicas)
+      ? {
+          asma:
+            !!body.enfermedadesCronicas.asma,
+
+          diabetes:
+            !!body.enfermedadesCronicas.diabetes,
+
+          otra: clampStr(
+            body.enfermedadesCronicas.otra
+          ),
+        }
+      : {
+          asma: false,
+          diabetes: false,
+          otra: "",
+        };
+
+  out.historialMedico =
+    Array.isArray(body.historialMedico)
+      ? body.historialMedico.map((item) => ({
+          fechaIso: clampStr(item?.fechaIso),
+
+          tipo: clampStr(item?.tipo),
+
+          descripcion: clampStr(
+            item?.descripcion,
+            1000
+          ),
+
+          registradoPor: clampStr(
+            item?.registradoPor
+          ),
+
+          observaciones: clampStr(
+            item?.observaciones,
+            1000
+          ),
+        }))
+      : [];
 
   // ===== Contacto
-  out.telCel        = clampStr(body.telCel);
-  out.telCasa       = clampStr(body.telCasa);
+  out.telCel = clampStr(body.telCel);
+  out.telCasa = clampStr(body.telCasa);
   out.emailPersonal = clampStr(body.emailPersonal);
-  out.calleNumero   = clampStr(body.calleNumero);
-  out.colonia       = clampStr(body.colonia);
-  out.codigoPostal  = clampStr(body.codigoPostal);
-  out.estado        = clampStr(body.estado);
-  out.municipio     = clampStr(body.municipio);
-  out.contactosEmergencia = Array.isArray(body.contactosEmergencia)
-    ? body.contactosEmergencia.map((c) => ({
-        nombre: clampStr(c.nombre),
-        telefono: clampStr(c.telefono),
-        parentesco: clampStr(c.parentesco),
-      }))
-    : [];
+  out.calleNumero = clampStr(body.calleNumero);
+  out.colonia = clampStr(body.colonia);
+  out.codigoPostal = clampStr(body.codigoPostal);
+  out.estado = clampStr(body.estado);
+  out.municipio = clampStr(body.municipio);
+
+  out.contactosEmergencia =
+    Array.isArray(body.contactosEmergencia)
+      ? body.contactosEmergencia.map(
+          (contacto) => ({
+            nombre: clampStr(
+              contacto?.nombre
+            ),
+
+            telefono: clampStr(
+              contacto?.telefono
+            ),
+
+            parentesco: clampStr(
+              contacto?.parentesco
+            ),
+          })
+        )
+      : [];
 
   // ===== Familia
-  if (Array.isArray(body.familia)) {
-    out.familia = body.familia.map((m) => ({
-      nombre: clampStr(m.nombre),
-      parentesco: clampStr(m.parentesco),
-      edad: Number(m.edad ?? 0),
-      telefono: clampStr(m.telefono),
-      escolaridad: clampStr(m.escolaridad),
-      viveConEl: !!m.viveConEl,
-      observaciones: clampStr(m.observaciones, 1000),
-    }));
-  }
+  out.familia =
+    Array.isArray(body.familia)
+      ? body.familia.map((miembro) => ({
+          nombre: clampStr(miembro?.nombre),
+
+          parentesco: clampStr(
+            miembro?.parentesco
+          ),
+
+          edad: safeNumber(
+            miembro?.edad,
+            0
+          ),
+
+          telefono: clampStr(
+            miembro?.telefono
+          ),
+
+          escolaridad: clampStr(
+            miembro?.escolaridad
+          ),
+
+          viveConEl:
+            !!miembro?.viveConEl,
+
+          observaciones: clampStr(
+            miembro?.observaciones,
+            1000
+          ),
+        }))
+      : [];
 
   // ===== Dependientes
-  if (Array.isArray(body.dependientes)) {
-    out.dependientes = body.dependientes.map((d) => ({
-      nombres: clampStr(d.nombres),
-      aPaterno: clampStr(d.aPaterno),
-      aMaterno: clampStr(d.aMaterno),
-      fechaNacIso: clampStr(d.fechaNacIso),
-      parentesco: clampStr(d.parentesco),
-      estudiante: !!d.estudiante,
-    }));
-  }
+  out.dependientes =
+    Array.isArray(body.dependientes)
+      ? body.dependientes.map(
+          (dependiente) => ({
+            nombres: clampStr(
+              dependiente?.nombres
+            ),
 
-  // ===== Documentos (solo metadatos)
+            aPaterno: clampStr(
+              dependiente?.aPaterno
+            ),
+
+            aMaterno: clampStr(
+              dependiente?.aMaterno
+            ),
+
+            fechaNacIso: clampStr(
+              dependiente?.fechaNacIso
+            ),
+
+            parentesco: clampStr(
+              dependiente?.parentesco
+            ),
+
+            estudiante:
+              !!dependiente?.estudiante,
+          })
+        )
+      : [];
+
+  // ===== Documentos
   if (isPlainObj(body.documentos)) {
-    const docOut = {};
-    for (const [k, v] of Object.entries(body.documentos)) {
-      docOut[k] = {
-        fileName: clampStr(v?.fileName),
-        mime: clampStr(v?.mime),
-        size: Number(v?.size ?? 0),
-        status: ["ok", "faltante", "revisar"].includes(v?.status)
-          ? v.status
+    const documentos = {};
+
+    for (
+      const [key, value] of
+      Object.entries(body.documentos)
+    ) {
+      documentos[key] = {
+        fileName: clampStr(
+          value?.fileName
+        ),
+
+        mime: clampStr(
+          value?.mime
+        ),
+
+        size: safeNumber(
+          value?.size,
+          0
+        ),
+
+        status: [
+          "ok",
+          "faltante",
+          "revisar",
+        ].includes(value?.status)
+          ? value.status
           : "faltante",
       };
     }
-    out.documentos = docOut;
+
+    out.documentos = documentos;
+  } else {
+    out.documentos = {};
   }
 
-  // Comentarios finales
-  out.comentarios = clampStr(body.comentarios, 2000);
+  out.comentarios = clampStr(
+    body.comentarios,
+    2000
+  );
 
-  return out;
-};
+  return stripUndefinedDeep(out);
+}
 
-/* ================
-   Rutas CRUD
-   ================ */
+/* =========================================================
+ * VALIDACIONES
+ * ======================================================= */
 
-/**
- * GET /api/colaboradores
- * ?limit=50
- * ?q=texto         → filtro por nombre/apellidos/correo
- * ?onlyDocentes=1  → preferentemente registros cuyo puesto incluya "docente"
- */
-router.get("/", async (req, res) => {
+function validateRequired(data) {
+  const noEmpleado =
+    String(data?.noEmpleado ?? "").trim();
+
+  const posicion =
+    String(data?.posicion ?? "").trim();
+
+  if (!noEmpleado) {
+    return "noEmpleado es requerido";
+  }
+
+  if (!posicion) {
+    return "posicion es requerida";
+  }
+
+  return null;
+}
+
+/* =========================================================
+ * BUSCAR POR FIRESTORE ID O NÚMERO DE EMPLEADO
+ * ======================================================= */
+
+async function findByIdOrNoEmpleado(idOrNo) {
+  const key =
+    String(idOrNo ?? "").trim();
+
+  if (!key) {
+    return null;
+  }
+
+  /*
+   * Primero se intenta como ID real
+   * del documento de Firestore.
+   */
   try {
-    const limit = Math.min(Number(req.query.limit || 20), 200);
-    const qText = String(req.query.q || "").trim();
+    const ref =
+      firestore
+        .collection(COL)
+        .doc(key);
 
-    const onlyDocentesRaw = String(req.query.onlyDocentes || "").toLowerCase();
-    const onlyDocentes =
-      onlyDocentesRaw === "1" ||
-      onlyDocentesRaw === "true" ||
-      onlyDocentesRaw === "yes";
+    const snap =
+      await ref.get();
 
-    const snap = await firestore
+    if (snap.exists) {
+      return {
+        ref,
+        snap,
+      };
+    }
+  } catch {
+    // continúa con noEmpleado
+  }
+
+  /*
+   * Si no existe como ID,
+   * intentamos por noEmpleado.
+   */
+  const query =
+    await firestore
       .collection(COL)
-      .orderBy("apellidoPaterno", "asc")
-      .limit(limit)
+      .where(
+        "noEmpleado",
+        "==",
+        key
+      )
+      .limit(1)
       .get();
 
-    let items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  if (query.empty) {
+    return null;
+  }
 
-    const norm = (s = "") =>
-      s
-        .toString()
-        .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "")
-        .toLowerCase();
+  const snap =
+    query.docs[0];
 
-    // 🔎 filtro por texto libre
+  return {
+    ref: snap.ref,
+    snap,
+  };
+}
+
+/* =========================================================
+ * VALIDAR NÚMERO DE EMPLEADO DUPLICADO
+ * ======================================================= */
+
+async function noEmpleadoDisponible(
+  noEmpleado,
+  currentId = null
+) {
+  const query =
+    await firestore
+      .collection(COL)
+      .where(
+        "noEmpleado",
+        "==",
+        noEmpleado
+      )
+      .limit(5)
+      .get();
+
+  return !query.docs.some(
+    (doc) =>
+      doc.id !== currentId
+  );
+}
+
+/* =========================================================
+ * HEALTH
+ *
+ * Prueba:
+ *
+ * GET /api/colaboradores/_health
+ * ======================================================= */
+
+router.get(
+  "/_health",
+  (_req, res) => {
+    res.json({
+      ok: true,
+      route: "colaboradores",
+    });
+  }
+);
+
+/* =========================================================
+ * GET LISTA
+ *
+ * GET /api/colaboradores
+ * ======================================================= */
+
+router.get("/", async (req, res) => {
+  try {
+    const requestedLimit =
+      req.query.limit ??
+      req.query.pageSize ??
+      MAX_LIST;
+
+    const parsedLimit =
+      Number(requestedLimit);
+
+    const limit =
+      Number.isFinite(parsedLimit) &&
+      parsedLimit > 0
+        ? Math.min(
+            Math.floor(parsedLimit),
+            MAX_LIST
+          )
+        : MAX_LIST;
+
+    const qText =
+      String(
+        req.query.q ?? ""
+      ).trim();
+
+    const onlyDocentesRaw =
+      String(
+        req.query.onlyDocentes ?? ""
+      ).toLowerCase();
+
+    const onlyDocentes =
+      ["1", "true", "yes"].includes(
+        onlyDocentesRaw
+      );
+
+    /*
+     * Traemos todos y ordenamos
+     * en memoria.
+     */
+    const snap =
+      await firestore
+        .collection(COL)
+        .limit(MAX_LIST)
+        .get();
+
+    let items =
+      snap.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+
+    items.sort((a, b) => {
+      const apellidoA =
+        norm(a.apellidoPaterno);
+
+      const apellidoB =
+        norm(b.apellidoPaterno);
+
+      if (
+        apellidoA !== apellidoB
+      ) {
+        return apellidoA.localeCompare(
+          apellidoB,
+          "es"
+        );
+      }
+
+      return norm(a.nombres)
+        .localeCompare(
+          norm(b.nombres),
+          "es"
+        );
+    });
+
+    /* ===== Buscar ===== */
+
     if (qText) {
-      const nq = norm(qText);
-      items = items.filter((c) => {
-        const blobs = [
-          c.nombres,
-          c.apellidoPaterno,
-          c.apellidoMaterno,
-          c.nombrePreferido,
-          c.correoInstitucional,
-          c.noEmpleado,
-        ];
-        return blobs.some((b) => norm(b).includes(nq));
-      });
+      const q =
+        norm(qText);
+
+      items =
+        items.filter((c) =>
+          [
+            c.nombres,
+            c.apellidoPaterno,
+            c.apellidoMaterno,
+            c.nombrePreferido,
+            c.correoInstitucional,
+            c.email,
+            c.noEmpleado,
+            c.posicion,
+            c.categoriaPuesto,
+            c.jefeInmediato,
+          ].some(
+            (value) =>
+              norm(value).includes(q)
+          )
+        );
     }
 
-    // 🔹 solo docentes (por posicion / categoriaPuesto)
-    if (onlyDocentes) {
-      const filtrados = items.filter((c) => {
-        const pos = (c.posicion || "").toString().toLowerCase();
-        const cat = (c.categoriaPuesto || "").toString().toLowerCase();
-        return pos.includes("docente") || cat.includes("docente");
-      });
+    /* ===== Solo docentes ===== */
 
-      // Si no hay ninguno marcado como docente, devolvemos todos
-      if (filtrados.length > 0) {
-        items = filtrados;
+    if (onlyDocentes) {
+      const docentes =
+        items.filter((c) => {
+          const posicion =
+            norm(c.posicion);
+
+          const categoria =
+            norm(
+              c.categoriaPuesto
+            );
+
+          return (
+            posicion.includes(
+              "docente"
+            ) ||
+            categoria.includes(
+              "docente"
+            )
+          );
+        });
+
+      if (docentes.length > 0) {
+        items = docentes;
       }
     }
 
-    res.json({ ok: true, items, nextCursor: null });
-  } catch (e) {
-    console.error("[GET /colaboradores] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
+    items =
+      items.slice(0, limit);
+
+    return res.json({
+      ok: true,
+      items,
+      nextCursor: null,
+    });
+  } catch (error) {
+    console.error(
+      "[GET /colaboradores] error:",
+      error
+    );
+
+    return res
+      .status(500)
+      .json({
+        ok: false,
+        error: String(error),
+      });
   }
 });
 
-// GET /api/colaboradores/:id
-router.get("/:id", async (req, res) => {
-  try {
-    const d = await firestore.collection(COL).doc(req.params.id).get();
-    if (!d.exists) {
-      return res.status(404).json({ ok: false, error: "No encontrado" });
-    }
-    res.json({ ok: true, item: { id: d.id, ...d.data() } });
-  } catch (e) {
-    console.error("[GET /colaboradores/:id] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+/* =========================================================
+ * GET UNO
+ *
+ * GET /api/colaboradores/:id
+ * ======================================================= */
 
-// POST /api/colaboradores
-router.post("/", async (req, res) => {
-  try {
-    const raw = pickColaborador(req.body);
-    const data = stripUndefinedDeep(raw);
+router.get(
+  "/:id",
+  async (req, res) => {
+    try {
+      const found =
+        await findByIdOrNoEmpleado(
+          req.params.id
+        );
 
-    if (!data.noEmpleado) {
+      if (!found) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Colaborador no encontrado",
+          });
+      }
+
+      return res.json({
+        ok: true,
+
+        item: {
+          id: found.snap.id,
+          ...found.snap.data(),
+        },
+      });
+    } catch (error) {
+      console.error(
+        "[GET /colaboradores/:id] error:",
+        error
+      );
+
       return res
-        .status(400)
-        .json({ ok: false, error: "noEmpleado es requerido" });
+        .status(500)
+        .json({
+          ok: false,
+          error: String(error),
+        });
     }
-    if (!data.posicion) {
+  }
+);
+
+/* =========================================================
+ * CREAR
+ *
+ * POST /api/colaboradores
+ * ======================================================= */
+
+router.post(
+  "/",
+  async (req, res) => {
+    try {
+      const data =
+        pickColaborador(
+          req.body ?? {}
+        );
+
+      const validationError =
+        validateRequired(data);
+
+      if (validationError) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              validationError,
+          });
+      }
+
+      const available =
+        await noEmpleadoDisponible(
+          data.noEmpleado
+        );
+
+      if (!available) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "noEmpleado ya existe",
+          });
+      }
+
+      const now =
+        new Date();
+
+      const ref =
+        await firestore
+          .collection(COL)
+          .add({
+            ...data,
+
+            createdAt: now,
+            updatedAt: now,
+          });
+
       return res
-        .status(400)
-        .json({ ok: false, error: "posicion es requerida" });
-    }
+        .status(201)
+        .json({
+          ok: true,
+          id: ref.id,
+        });
+    } catch (error) {
+      console.error(
+        "[POST /colaboradores] error:",
+        error
+      );
 
-    const dup = await firestore
-      .collection(COL)
-      .where("noEmpleado", "==", data.noEmpleado)
-      .limit(1)
-      .get();
-    if (!dup.empty) {
       return res
-        .status(409)
-        .json({ ok: false, error: "noEmpleado ya existe" });
+        .status(500)
+        .json({
+          ok: false,
+          error: String(error),
+        });
     }
-
-    data.createdAt = new Date();
-    data.updatedAt = new Date();
-
-    const ref = await firestore.collection(COL).add(data);
-    res.status(201).json({ ok: true, id: ref.id });
-  } catch (e) {
-    console.error("[POST /colaboradores] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
   }
-});
+);
 
-// PUT /api/colaboradores/:id
-router.put("/:id", async (req, res) => {
-  try {
-    const raw = pickColaborador(req.body);
-    const data = stripUndefinedDeep(raw);
-    data.updatedAt = new Date();
+/* =========================================================
+ * ACTUALIZAR COMPLETO
+ *
+ * PUT /api/colaboradores/:id
+ * ======================================================= */
 
-    await firestore.collection(COL).doc(req.params.id).set(data, { merge: false });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[PUT /colaboradores/:id] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
+router.put(
+  "/:id",
+  async (req, res) => {
+    try {
+      const found =
+        await findByIdOrNoEmpleado(
+          req.params.id
+        );
+
+      if (!found) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Colaborador no encontrado",
+          });
+      }
+
+      const data =
+        pickColaborador(
+          req.body ?? {}
+        );
+
+      const validationError =
+        validateRequired(data);
+
+      if (validationError) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              validationError,
+          });
+      }
+
+      const available =
+        await noEmpleadoDisponible(
+          data.noEmpleado,
+          found.snap.id
+        );
+
+      if (!available) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "noEmpleado ya existe en otro colaborador",
+          });
+      }
+
+      const current =
+        found.snap.data() ?? {};
+
+      await found.ref.set(
+        {
+          ...data,
+
+          createdAt:
+            current.createdAt ??
+            new Date(),
+
+          updatedAt:
+            new Date(),
+        },
+        {
+          merge: false,
+        }
+      );
+
+      return res.json({
+        ok: true,
+        id: found.ref.id,
+      });
+    } catch (error) {
+      console.error(
+        "[PUT /colaboradores/:id] error:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error: String(error),
+        });
+    }
   }
-});
+);
 
-// PATCH /api/colaboradores/:id
-router.patch("/:id", async (req, res) => {
-  try {
-    const raw = pickColaborador(req.body);
-    const data = stripUndefinedDeep(raw);
-    data.updatedAt = new Date();
+/* =========================================================
+ * PATCH
+ *
+ * PATCH /api/colaboradores/:id
+ * ======================================================= */
 
-    await firestore.collection(COL).doc(req.params.id).set(data, { merge: true });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[PATCH /colaboradores/:id] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
+router.patch(
+  "/:id",
+  async (req, res) => {
+    try {
+      const found =
+        await findByIdOrNoEmpleado(
+          req.params.id
+        );
+
+      if (!found) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Colaborador no encontrado",
+          });
+      }
+
+      const current =
+        found.snap.data() ?? {};
+
+      const incoming =
+        req.body ?? {};
+
+      const mergedInput = {
+        ...current,
+        ...incoming,
+
+        enfermedadesCronicas:
+          hasOwn(
+            incoming,
+            "enfermedadesCronicas"
+          )
+            ? {
+                ...(
+                  current.enfermedadesCronicas ??
+                  {}
+                ),
+
+                ...(
+                  incoming.enfermedadesCronicas ??
+                  {}
+                ),
+              }
+            : current.enfermedadesCronicas,
+
+        documentos:
+          hasOwn(
+            incoming,
+            "documentos"
+          )
+            ? {
+                ...(
+                  current.documentos ??
+                  {}
+                ),
+
+                ...(
+                  incoming.documentos ??
+                  {}
+                ),
+              }
+            : current.documentos,
+      };
+
+      const data =
+        pickColaborador(
+          mergedInput
+        );
+
+      const validationError =
+        validateRequired(data);
+
+      if (validationError) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              validationError,
+          });
+      }
+
+      const available =
+        await noEmpleadoDisponible(
+          data.noEmpleado,
+          found.snap.id
+        );
+
+      if (!available) {
+        return res
+          .status(409)
+          .json({
+            ok: false,
+            error:
+              "noEmpleado ya existe en otro colaborador",
+          });
+      }
+
+      await found.ref.set(
+        {
+          ...data,
+
+          createdAt:
+            current.createdAt ??
+            new Date(),
+
+          updatedAt:
+            new Date(),
+        },
+        {
+          merge: false,
+        }
+      );
+
+      return res.json({
+        ok: true,
+        id: found.ref.id,
+      });
+    } catch (error) {
+      console.error(
+        "[PATCH /colaboradores/:id] error:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error: String(error),
+        });
+    }
   }
-});
+);
 
-// DELETE /api/colaboradores/:id
-router.delete("/:id", async (req, res) => {
-  try {
-    await firestore.collection(COL).doc(req.params.id).delete();
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[DELETE /colaboradores/:id] error:", e);
-    res.status(500).json({ ok: false, error: String(e) });
+/* =========================================================
+ * ELIMINAR
+ *
+ * DELETE /api/colaboradores/:id
+ * ======================================================= */
+
+router.delete(
+  "/:id",
+  async (req, res) => {
+    try {
+      const found =
+        await findByIdOrNoEmpleado(
+          req.params.id
+        );
+
+      if (!found) {
+        return res
+          .status(404)
+          .json({
+            ok: false,
+            error:
+              "Colaborador no encontrado",
+          });
+      }
+
+      await found.ref.delete();
+
+      return res.json({
+        ok: true,
+        id: found.ref.id,
+      });
+    } catch (error) {
+      console.error(
+        "[DELETE /colaboradores/:id] error:",
+        error
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error: String(error),
+        });
+    }
   }
-});
+);
 
 export default router;

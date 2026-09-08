@@ -110,18 +110,23 @@ router.post("/", requireAuth, async (req, res) => {
     let pushResults = [];
     if (payload.visibleParaPadres && payload.notificarPadres) {
       try {
-        const pushMsg = {
+        const buildPushMsg = (matricula) => ({
           title: "📄 Nuevo oficio",
-          body:  payload.titulo || "Tienes un nuevo oficio disponible.",
-          data:  { kind: "oficio", oficioId: ref.id, categoria: payload.categoria },
-        };
+          body: payload.titulo || "Tienes un nuevo oficio disponible.",
+          data: {
+            kind: "oficio",
+            oficioId: ref.id,
+            categoria: payload.categoria,
+            alumnoMatricula: normMat(matricula),
+          },
+        });
 
         if (esParaTodos) {
           // Todos los alumnos
           const snap = await firestore.collection("alumnos").select("matricula").limit(2000).get();
           const mats = snap.docs.map((d) => normMat(d.data()?.matricula)).filter(Boolean);
           for (const m of mats) {
-            try { pushResults.push({ m, r: await sendPushToAlumno(m, pushMsg) }); }
+            try { pushResults.push({ m, r: await sendPushToAlumno(m, buildPushMsg(m)) }); }
             catch (e) { console.error(`push err ${m}:`, e); }
           }
 
@@ -143,7 +148,7 @@ router.post("/", requireAuth, async (req, res) => {
             const mats = snap.docs.map((d) => normMat(d.data()?.matricula)).filter(Boolean);
             for (const m of mats) {
               if (!pushResults.find((r) => r.m === m)) {
-                try { pushResults.push({ m, r: await sendPushToAlumno(m, pushMsg) }); }
+                try { pushResults.push({ m, r: await sendPushToAlumno(m, buildPushMsg(m)) }); }
                 catch (e) { console.error(`push err ${m}:`, e); }
               }
             }
@@ -152,7 +157,7 @@ router.post("/", requireAuth, async (req, res) => {
         } else {
           // Destinatarios manuales (matrículas)
           for (const m of destinatarios) {
-            try { pushResults.push({ m, r: await sendPushToAlumno(m, pushMsg) }); }
+            try { pushResults.push({ m, r: await sendPushToAlumno(m, buildPushMsg(m)) }); }
             catch (e) { console.error(`push err ${m}:`, e); }
           }
         }

@@ -334,8 +334,10 @@ router.post("/", requireAuth, async (req, res) => {
               ? "Se agregó un nuevo evento al calendario escolar."
               : `Nuevo evento programado para ${fechaInicio}`,
             data: {
+              kind: "calendario",
               type: "calendario",
               eventId: docRef.id,
+              alumnoMatricula: normMatricula(mat),
             },
           })
         )
