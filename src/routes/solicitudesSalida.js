@@ -17,6 +17,47 @@ const ALUMNOS_COL = firestore.collection("alumnos");
 
 const FV = admin.firestore.FieldValue;
 
+let alumnosSearchCache = [];
+let alumnosSearchCacheAt = 0;
+const ALUMNOS_SEARCH_CACHE_TTL_MS = 5 * 60_000;
+
+function normalizeSearch(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+async function getAlumnosSearchIndex() {
+  if (
+    alumnosSearchCache.length &&
+    Date.now() - alumnosSearchCacheAt < ALUMNOS_SEARCH_CACHE_TTL_MS
+  ) {
+    return alumnosSearchCache;
+  }
+
+  const snap = await ALUMNOS_COL.get();
+  alumnosSearchCache = snap.docs.map((doc) => {
+    const data = doc.data() || {};
+    const nombres = cleanStr(data.nombres || data.nombre || "", 200);
+    const apellidos = cleanStr(data.apellidos || "", 200);
+    const nombre = `${nombres} ${apellidos}`.replace(/\s+/g, " ").trim();
+
+    return {
+      matricula: doc.id,
+      nombre: nombre || doc.id,
+      nivel: cleanStr(data.nivel, 100) || null,
+      grado: cleanStr(data.grado, 100) || null,
+      grupo: cleanStr(data.grupo, 100) || null,
+      nombreBusqueda: normalizeSearch(`${nombre} ${doc.id}`),
+    };
+  });
+  alumnosSearchCacheAt = Date.now();
+
+  return alumnosSearchCache;
+}
+
 /* =========================================================
  * Estados
  * ======================================================= */
@@ -677,6 +718,174 @@ router.post(
 );
 
 /* =========================================================
+ * POST /manual
+ *
+ * Registro manual de salida por un colaborador.
+ * Si ya existe una solicitud activa, la completa.
+ * Si no existe, crea un registro finalizado para el historial.
+ * ======================================================= */
+
+router.post(
+  "/manual",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (getRole(req) !== "colaborador") {
+        return res.status(403).json({ ok: false, error: "solo_colaboradores" });
+      }
+
+      const alumnoMatricula = normMatricula(req.body?.alumnoMatricula);
+      const puntoSalida = cleanStr(req.body?.puntoSalida, 100);
+      const personaRecoge = cleanStr(req.body?.personaRecoge, 200);
+      const motivo = cleanStr(req.body?.motivo, 500);
+      const confirmado = req.body?.confirmado === true;
+
+      if (!alumnoMatricula || !puntoSalida || !personaRecoge || !motivo) {
+        return res.status(400).json({
+          ok: false,
+          error: "campos_requeridos",
+          message: "Indica matrícula, salida, quién recoge y motivo.",
+        });
+      }
+
+      if (!["Salida 1", "Salida 2", "Salida 3"].includes(puntoSalida)) {
+        return res.status(400).json({ ok: false, error: "salida_invalida" });
+      }
+
+      if (!confirmado) {
+        return res.status(400).json({ ok: false, error: "confirmacion_requerida" });
+      }
+
+      const alumno = await getAlumnoSnapshot(alumnoMatricula);
+      if (!alumno) {
+        return res.status(404).json({ ok: false, error: "alumno_no_encontrado" });
+      }
+
+      const colaboradorId = getColaboradorId(req);
+      const colaboradorNombre = getColaboradorNombre(req);
+      const now = FV.serverTimestamp();
+      const nowIso = new Date().toISOString();
+      const active = await findActiveSolicitud(alumnoMatricula);
+      const ref = active ? COL.doc(active.id) : COL.doc();
+      const qrRef = firestore.collection("qrScans").doc();
+      const notaEvento = `Salida manual · ${puntoSalida} · Recoge: ${personaRecoge} · Motivo: ${motivo}`;
+      const event = makeEstadoEvent({
+        estado: "entregado",
+        actorRole: "colaborador",
+        actorId: colaboradorId,
+        actorNombre: colaboradorNombre,
+        nota: notaEvento,
+      });
+
+      const scanData = {
+        alumnoMatricula,
+        tipo: "salida",
+        puntoControl: puntoSalida,
+        fuente: "manual",
+        colaboradorId,
+        colaboradorNombre,
+        raw: "",
+        meta: { nota: puntoSalida, puntoControl: puntoSalida, personaRecoge, motivo },
+        alumnoNombre: alumno.nombre || null,
+        alumnoGrado: alumno.grado || null,
+        alumnoGrupo: alumno.grupo || null,
+        alumnoNivel: alumno.nivel || null,
+        createdAt: now,
+        createdAtIso: nowIso,
+      };
+
+      if (active) {
+        const currentSnap = await ref.get();
+        if (!currentSnap.exists || !ESTADOS_ACTIVOS.includes(String(currentSnap.data()?.estado || ""))) {
+          return res.status(409).json({ ok: false, error: "solicitud_ya_actualizada" });
+        }
+
+        await ref.update({
+          estado: "entregado",
+          entregadoAt: now,
+          entregadoAtIso: nowIso,
+          updatedAt: now,
+          updatedAtIso: nowIso,
+          atendidoPorId: colaboradorId || null,
+          atendidoPorNombre: colaboradorNombre || null,
+          puntoSalida,
+          salidaFuente: "manual",
+          salidaAt: now,
+          salidaAtIso: nowIso,
+          salidaPorId: colaboradorId || null,
+          salidaPorNombre: colaboradorNombre || null,
+          personaRecoge,
+          motivoSalida: motivo,
+          qrScanId: qrRef.id,
+          historialEstados: FV.arrayUnion(event),
+        });
+      } else {
+        await ref.set({
+          alumnoMatricula,
+          alumnoNombre: alumno.nombre || null,
+          alumnoNombres: alumno.nombres || null,
+          alumnoApellidos: alumno.apellidos || null,
+          alumnoNivel: alumno.nivel || null,
+          alumnoGrado: alumno.grado || null,
+          alumnoGrupo: alumno.grupo || null,
+          alumnoGrupoPrincipal: alumno.grupoPrincipal || null,
+          estado: "entregado",
+          nota: "Salida registrada manualmente, sin solicitud familiar previa.",
+          notaAtencion: notaEvento,
+          accountId: null,
+          solicitanteEmail: null,
+          solicitanteTipo: "registro_manual",
+          atendidoPorId: colaboradorId || null,
+          atendidoPorNombre: colaboradorNombre || null,
+          createdAt: now,
+          createdAtIso: nowIso,
+          updatedAt: now,
+          updatedAtIso: nowIso,
+          enProcesoAt: null,
+          enProcesoAtIso: null,
+          listoAt: null,
+          listoAtIso: null,
+          entregadoAt: now,
+          entregadoAtIso: nowIso,
+          canceladoAt: null,
+          canceladoAtIso: null,
+          puntoSalida,
+          salidaFuente: "manual",
+          salidaAt: now,
+          salidaAtIso: nowIso,
+          salidaPorId: colaboradorId || null,
+          salidaPorNombre: colaboradorNombre || null,
+          personaRecoge,
+          motivoSalida: motivo,
+          qrScanId: qrRef.id,
+          historialEstados: [event],
+        });
+      }
+
+      await qrRef.set({ ...scanData, solicitudId: ref.id });
+      const push = await sendEstadoPush({
+        solicitudId: ref.id,
+        matricula: alumnoMatricula,
+        alumnoNombre: alumno.nombre,
+        estado: "entregado",
+      });
+      const saved = await ref.get();
+
+      return res.status(active ? 200 : 201).json({
+        ok: true,
+        item: { id: saved.id, ...saved.data() },
+        qrScanId: qrRef.id,
+        createdManual: !active,
+        push,
+      });
+    } catch (error) {
+      console.error("[POST /api/solicitudes-salida/manual] error:", error);
+      return res.status(500).json({ ok: false, error: String(error) });
+    }
+  }
+);
+
+/* =========================================================
  * GET /
  *
  * IMPORTANTE:
@@ -1143,6 +1352,41 @@ router.get(
           error:
             String(error),
         });
+    }
+  }
+);
+
+/* =========================================================
+ * GET /buscar-alumnos?q=...
+ * Busca alumnos por nombre completo o matrícula.
+ * ======================================================= */
+
+router.get(
+  "/buscar-alumnos",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (getRole(req) !== "colaborador") {
+        return res.status(403).json({ ok: false, error: "solo_colaboradores" });
+      }
+
+      const q = cleanStr(req.query?.q, 120);
+      const query = normalizeSearch(q);
+      if (query.length < 2) {
+        return res.json({ ok: true, items: [] });
+      }
+
+      const alumnos = await getAlumnosSearchIndex();
+      const items = alumnos
+        .filter((alumno) => alumno.nombreBusqueda.includes(query))
+        .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
+        .slice(0, 15)
+        .map(({ nombreBusqueda, ...alumno }) => alumno);
+
+      return res.json({ ok: true, items });
+    } catch (error) {
+      console.error("[GET /api/solicitudes-salida/buscar-alumnos] error:", error);
+      return res.status(500).json({ ok: false, error: String(error) });
     }
   }
 );

@@ -8,6 +8,8 @@ const router = Router();
 
 const COL = firestore.collection("qrScans");
 const ALUMNOS_COL = firestore.collection("alumnos");
+const SOLICITUDES_COL = firestore.collection("solicitudesSalida");
+const ESTADOS_ACTIVOS_SALIDA = ["solicitado", "en_proceso", "listo"];
 
 /* =========================
    Helpers
@@ -68,6 +70,121 @@ async function getAlumnoSnapshotByMatricula(matricula) {
   }
 }
 
+async function findActiveSolicitudSalida(matricula) {
+  for (const estado of ESTADOS_ACTIVOS_SALIDA) {
+    const snap = await SOLICITUDES_COL
+      .where("alumnoMatricula", "==", matricula)
+      .where("estado", "==", estado)
+      .limit(1)
+      .get();
+
+    if (!snap.empty) {
+      return { id: snap.docs[0].id, ...snap.docs[0].data() };
+    }
+  }
+
+  return null;
+}
+
+async function registrarSalidaEnSolicitudes({
+  matricula,
+  puntoSalida,
+  colaboradorId,
+  colaboradorNombre,
+  alumnoSnap,
+  scanId,
+}) {
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const nowIso = new Date().toISOString();
+  const active = await findActiveSolicitudSalida(matricula);
+
+  if (active) {
+    const ref = SOLICITUDES_COL.doc(active.id);
+    const event = {
+      estado: "entregado",
+      atIso: nowIso,
+      actorRole: "colaborador",
+      actorId: colaboradorId,
+      actorNombre: colaboradorNombre,
+      nota: `Salida por QR · ${puntoSalida}`,
+    };
+
+    await ref.update({
+      estado: "entregado",
+      entregadoAt: now,
+      entregadoAtIso: nowIso,
+      updatedAt: now,
+      updatedAtIso: nowIso,
+      atendidoPorId: colaboradorId || null,
+      atendidoPorNombre: colaboradorNombre || null,
+      puntoSalida,
+      salidaFuente: "qr",
+      salidaAt: now,
+      salidaAtIso: nowIso,
+      salidaPorId: colaboradorId || null,
+      salidaPorNombre: colaboradorNombre || null,
+      salidaScanId: scanId,
+      historialEstados: admin.firestore.FieldValue.arrayUnion(event),
+    });
+
+    const updated = await ref.get();
+    return { id: updated.id, ...updated.data() };
+  }
+
+  const ref = SOLICITUDES_COL.doc();
+  const event = {
+    estado: "entregado",
+    atIso: nowIso,
+    actorRole: "colaborador",
+    actorId: colaboradorId,
+    actorNombre: colaboradorNombre,
+    nota: `Salida QR sin solicitud previa · ${puntoSalida}`,
+  };
+
+  const data = {
+    alumnoMatricula: matricula,
+    alumnoNombre: alumnoSnap?.alumnoNombre || null,
+    alumnoNombres: null,
+    alumnoApellidos: null,
+    alumnoNivel: alumnoSnap?.alumnoNivel || null,
+    alumnoGrado: alumnoSnap?.alumnoGrado || null,
+    alumnoGrupo: alumnoSnap?.alumnoGrupo || null,
+    alumnoGrupoPrincipal: null,
+    estado: "entregado",
+    nota: "Salida registrada con QR sin solicitud familiar previa.",
+    notaAtencion: event.nota,
+    accountId: null,
+    solicitanteEmail: null,
+    solicitanteTipo: "registro_qr",
+    atendidoPorId: colaboradorId || null,
+    atendidoPorNombre: colaboradorNombre || null,
+    createdAt: now,
+    createdAtIso: nowIso,
+    updatedAt: now,
+    updatedAtIso: nowIso,
+    entregadoAt: now,
+    entregadoAtIso: nowIso,
+    canceladoAt: null,
+    canceladoAtIso: null,
+    enProcesoAt: null,
+    enProcesoAtIso: null,
+    listoAt: null,
+    listoAtIso: null,
+    puntoSalida,
+    salidaFuente: "qr",
+    salidaAt: now,
+    salidaAtIso: nowIso,
+    salidaPorId: colaboradorId || null,
+    salidaPorNombre: colaboradorNombre || null,
+    salidaScanId: scanId,
+    historialEstados: [event],
+  };
+
+  await ref.set(data);
+  const created = await ref.get();
+  return { id: created.id, ...created.data() };
+}
+
 /* =========================
    POST /api/qr/scan
    ========================= */
@@ -82,10 +199,15 @@ router.post("/scan", requireAuth, async (req, res) => {
     const code = body.code ?? (body.matricula ? `MAT:${body.matricula}` : "");
     const tipo = String(body.tipo || "entrada");
 
-    const meta =
+    const metaBase =
       body.meta && typeof body.meta === "object"
         ? body.meta
-        : { nota: body.nota ?? "" };
+        : {};
+    const nota = String(body.nota ?? metaBase.nota ?? "").trim().slice(0, 500);
+    const puntoControl = String(
+      body.puntoControl ?? body.puntoSalida ?? metaBase.puntoControl ?? nota ?? metaBase.nota ?? ""
+    ).trim().slice(0, 100);
+    const meta = { ...metaBase, nota, puntoControl };
 
     const alumnoMatricula = parseMatFromQr(code);
     if (!alumnoMatricula) {
@@ -104,6 +226,8 @@ router.post("/scan", requireAuth, async (req, res) => {
     const payload = {
       alumnoMatricula,
       tipo,
+      puntoControl: puntoControl || null,
+      fuente: "qr",
       colaboradorId,
       colaboradorNombre,
       raw: String(code || ""),
@@ -119,6 +243,23 @@ router.post("/scan", requireAuth, async (req, res) => {
     };
 
     const ref = await COL.add(payload);
+
+    let solicitudSalida = null;
+    if (String(tipo).toLowerCase() === "salida") {
+      try {
+        solicitudSalida = await registrarSalidaEnSolicitudes({
+          matricula: alumnoMatricula,
+          puntoSalida: puntoControl || "Sin especificar",
+          colaboradorId,
+          colaboradorNombre,
+          alumnoSnap,
+          scanId: ref.id,
+        });
+        await ref.update({ solicitudId: solicitudSalida.id });
+      } catch (error) {
+        console.error("[qr/scan] no se pudo asociar la solicitud de salida:", error);
+      }
+    }
 
     /* =========================
        PUSH NOTIFICATION
@@ -159,6 +300,7 @@ router.post("/scan", requireAuth, async (req, res) => {
     return res.status(201).json({
       ok: true,
       item: { id: snap.id, ...snap.data() },
+      solicitudSalida,
       push: pushResult,
     });
   } catch (e) {
@@ -180,7 +322,6 @@ router.get("/history", requireAuth, async (req, res) => {
 
     const {
       alumno = "",
-      tipo = "",
       from = "",
       to = "",
       q = "",
@@ -211,7 +352,9 @@ router.get("/history", requireAuth, async (req, res) => {
           )
         : COL.orderBy("createdAtIso", "desc");
 
-    if (tipo) query = query.where("tipo", "==", String(tipo));
+    // El Historial QR está reservado para entradas.
+    // Las salidas se guardan en solicitudesSalida y se consultan desde su historial.
+    query = query.where("tipo", "==", "entrada");
 
     if (from) {
       const isoFrom = new Date(`${from}T00:00:00.000Z`).toISOString();
